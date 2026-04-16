@@ -1,21 +1,24 @@
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+print(f"API key loaded: {bool(os.getenv('ANTHROPIC_API_KEY'))}")
+
+import anthropic
 import base64
 import json as json_lib
-import os
 import pickle
 import random
 import re
 import threading
 import time
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Dict, Optional
-import anthropic as _anthropic
 
-load_dotenv()
-_anthropic_client = _anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 import numpy as np
 import pandas as pd
@@ -970,12 +973,12 @@ def _strip_actions(text: str) -> str:
 
 
 @app.post("/copilot/chat")
-async def copilot_chat(req: CopilotChatRequest):
+def copilot_chat(req: CopilotChatRequest):
     context = _build_copilot_context(req.project_id)
     user_content = f"Project context:\n{context}\n\nUser question: {req.message}"
     try:
-        response = await _anthropic_client.messages.create(
-            model      = "claude-sonnet-4-20250514",
+        response = client.messages.create(
+            model      = "claude-sonnet-4-5",
             max_tokens = 512,
             system     = COPILOT_SYSTEM,
             messages   = [{"role": "user", "content": user_content}],
