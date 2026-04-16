@@ -1,14 +1,21 @@
 import base64
 import json as json_lib
+import os
 import pickle
 import random
+import re
 import threading
 import time
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Dict, Optional
+import anthropic as _anthropic
+
+load_dotenv()
+_anthropic_client = _anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 import numpy as np
 import pandas as pd
@@ -29,7 +36,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -846,3 +853,134 @@ def export_efp(project_id: str):
         media_type = "application/json",
         headers    = {"Content-Disposition": f'attachment; filename="{project_id}.efp"'},
     )
+
+
+# ── /copilot/chat ─────────────────────────────────────────────────────────────
+
+COPILOT_SYSTEM = (
+    "You are an expert embedded ML pipeline engineer helping a hardware engineer optimize "
+    "their sensor classification project. You have access to real signal analysis data for "
+    "their specific project — use it. Give specific actionable advice with exact numbers "
+    "from their actual data, never generic ML advice. When recommending a parameter change "
+    "include an action block: [ACTION: set_cutoff=24.8] or [ACTION: set_window=800] or "
+    "[ACTION: set_model=random_forest] or [ACTION: add_feature=kurtosis] "
+    "Keep responses to 3-5 sentences unless asked for detail. "
+    "You are talking to a hardware engineer who understands signal processing but may be new to ML."
+)
+
+
+class CopilotChatRequest(BaseModel):
+    message:    str
+    project_id: str
+
+
+def _build_copilot_context(project_id: str) -> str:
+    parts = []
+
+    # Project config
+    proj = projects.get(project_id)
+    if proj:
+        parts.append(f"Project: {project_id}")
+        parts.append(f"Sensor: {proj.get('sensor_type', 'unknown')}")
+        parts.append(f"Target MCU: {proj.get('target_mcu', 'unknown')}")
+
+    # Cached events → class distribution + duration stats
+    evts = project_events.get(project_id, [])
+    if evts:
+        label_counts: Dict[str, int] = {}
+        for ev in evts:
+            lbl = ev.class_label or "unknown"
+            label_counts[lbl] = label_counts.get(lbl, 0) + 1
+        durations = [ev.duration_ms for ev in evts]
+        parts.append(f"Events captured: {len(evts)}")
+        parts.append(f"Class distribution: {label_counts}")
+        parts.append(
+            f"Event durations: min={min(durations):.0f} ms, "
+            f"mean={sum(durations)/len(durations):.0f} ms, "
+            f"max={max(durations):.0f} ms"
+        )
+
+    # Pipeline config from saved pipeline
+    if _saved_pipeline:
+        cfg  = _saved_pipeline["config"]
+        le   = _saved_pipeline["label_encoder"]
+        cols = _saved_pipeline["selected_cols"]
+        parts.append(
+            f"Pipeline: cutoff={cfg['cutoff_hz']} Hz, "
+            f"window={cfg['window_ms']} ms, interpolation={cfg['interpolation']}"
+        )
+        parts.append(f"Selected features: {cols[:6]}{'...' if len(cols) > 6 else ''}")
+        parts.append(f"Classes: {le.classes_.tolist()}")
+
+    # Training results
+    with _training_lock:
+        tr = _training_status.get("results")
+    if tr:
+        best_id = tr.get("best_model_id", "")
+        models  = tr.get("models", [])
+        best    = next((m for m in models if m["id"] == best_id), None)
+        if best:
+            parts.append(
+                f"Best model: {best['name']} "
+                f"(CV accuracy: {best['cv_accuracy']*100:.1f}%, "
+                f"train accuracy: {best['accuracy']*100:.1f}%)"
+            )
+        for m in models:
+            if m["id"] != best_id:
+                parts.append(
+                    f"  {m['name']}: CV={m['cv_accuracy']*100:.1f}%, "
+                    f"train={m['accuracy']*100:.1f}%"
+                )
+        # Per-class confusion matrix breakdown
+        cm    = tr.get("confusion_matrix", [])
+        clabs = tr.get("class_labels", [])
+        if cm and clabs:
+            parts.append("Confusion matrix per class:")
+            for ri, (lbl, row) in enumerate(zip(clabs, cm)):
+                total   = sum(row)
+                correct = row[ri] if ri < len(row) else 0
+                if total > 0:
+                    parts.append(
+                        f"  '{lbl}': {correct}/{total} correct "
+                        f"({correct/total*100:.0f}%)"
+                    )
+
+    if not parts:
+        return "No project data available yet — user is in early setup."
+
+    return "\n".join(parts)
+
+
+def _parse_actions(text: str) -> list:
+    pattern = r'\[ACTION:\s*([^=\]\s]+)\s*=\s*([^\]]+)\]'
+    actions = []
+    for m in re.finditer(pattern, text):
+        key = m.group(1).strip()
+        raw = m.group(2).strip()
+        try:
+            value = float(raw) if "." in raw else int(raw)
+        except ValueError:
+            value = raw
+        actions.append({"type": key, "value": value})
+    return actions
+
+
+def _strip_actions(text: str) -> str:
+    return re.sub(r'\[ACTION:[^\]]+\]', '', text).strip()
+
+
+@app.post("/copilot/chat")
+async def copilot_chat(req: CopilotChatRequest):
+    context = _build_copilot_context(req.project_id)
+    user_content = f"Project context:\n{context}\n\nUser question: {req.message}"
+    try:
+        response = await _anthropic_client.messages.create(
+            model      = "claude-sonnet-4-20250514",
+            max_tokens = 512,
+            system     = COPILOT_SYSTEM,
+            messages   = [{"role": "user", "content": user_content}],
+        )
+        raw_text = response.content[0].text
+        return {"message": _strip_actions(raw_text), "actions": _parse_actions(raw_text)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
