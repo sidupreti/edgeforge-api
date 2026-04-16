@@ -873,85 +873,213 @@ COPILOT_SYSTEM = (
 
 
 class CopilotChatRequest(BaseModel):
-    message:    str
-    project_id: str
+    message:         str
+    project_id:      str
+    screen:          Optional[str]  = None   # collect | pipeline | train | validate | export
+    pipeline_config: Optional[dict] = None   # current frontend slider/feature state
 
 
-def _build_copilot_context(project_id: str) -> str:
-    parts = []
+_SCREEN_HINTS: Dict[str, str] = {
+    "collect": (
+        "User is on the DATA COLLECTION screen. "
+        "Prioritise advice about data quality, class balance, event count sufficiency, "
+        "and signal characteristics. Flag any class with fewer than 15 events."
+    ),
+    "pipeline": (
+        "User is on the PIPELINE CONFIGURATION screen. "
+        "Prioritise advice about low-pass cutoff frequency, normalisation window length, "
+        "feature selection, and model choice. Reference the signal analysis numbers."
+    ),
+    "train": (
+        "User is on the TRAINING screen. "
+        "Prioritise advice about model performance, overfitting (train vs CV gap), "
+        "which classes are most confused, and whether more data or different features would help."
+    ),
+    "validate": (
+        "User is on the LIVE VALIDATION screen. "
+        "Prioritise advice about classification confidence, which classes are hardest to "
+        "distinguish in real-time inference, and deployment readiness."
+    ),
+    "export": (
+        "User is on the EXPORT screen. "
+        "Prioritise advice about deployment format, model size vs accuracy trade-offs, "
+        "and MCU memory/latency compatibility."
+    ),
+}
 
-    # Project config
+
+def _build_copilot_context(
+    project_id:      str,
+    screen:          Optional[str]  = None,
+    pipeline_config: Optional[dict] = None,
+) -> str:
+    sections: list = []
+
+    # ── 1. Screen context ──────────────────────────────────────────────────────
+    if screen and screen in _SCREEN_HINTS:
+        sections.append(f"[CURRENT SCREEN] {_SCREEN_HINTS[screen]}")
+
+    # ── 2. Project info ────────────────────────────────────────────────────────
     proj = projects.get(project_id)
     if proj:
-        parts.append(f"Project: {project_id}")
-        parts.append(f"Sensor: {proj.get('sensor_type', 'unknown')}")
-        parts.append(f"Target MCU: {proj.get('target_mcu', 'unknown')}")
+        lines = [
+            f"Project: {project_id}",
+            f"Sensor: {proj.get('sensor_type', 'unknown')}",
+            f"Target MCU: {proj.get('target_mcu', 'unknown')}",
+            f"Connection: {proj.get('connection_type', 'unknown')}",
+        ]
+        sections.append("PROJECT:\n" + "\n".join(lines))
 
-    # Cached events → class distribution + duration stats
+    # ── 3. Data quality ────────────────────────────────────────────────────────
     evts = project_events.get(project_id, [])
     if evts:
         label_counts: Dict[str, int] = {}
         for ev in evts:
             lbl = ev.class_label or "unknown"
             label_counts[lbl] = label_counts.get(lbl, 0) + 1
+
         durations = [ev.duration_ms for ev in evts]
-        parts.append(f"Events captured: {len(evts)}")
-        parts.append(f"Class distribution: {label_counts}")
-        parts.append(
-            f"Event durations: min={min(durations):.0f} ms, "
+        lines = [f"Total events captured: {len(evts)}"]
+
+        lines.append("Events per class:")
+        for lbl, cnt in sorted(label_counts.items(), key=lambda x: -x[1]):
+            pct = cnt / len(evts) * 100
+            flag = "  ⚠ low" if cnt < 15 else ""
+            lines.append(f"  '{lbl}': {cnt} events ({pct:.0f}%){flag}")
+
+        counts = list(label_counts.values())
+        if len(counts) > 1:
+            ratio = max(counts) / max(min(counts), 1)
+            if ratio > 3:
+                lines.append(
+                    f"Class imbalance: {ratio:.1f}x — model will be biased toward "
+                    f"'{max(label_counts, key=label_counts.get)}'. Collect more of the minority class."
+                )
+            else:
+                lines.append(f"Class balance: {ratio:.1f}x ratio — acceptable.")
+        elif len(counts) == 1:
+            lines.append("WARNING: Only one class present — need ≥2 classes to train a classifier.")
+
+        lines.append(
+            f"Event duration: min={min(durations):.0f} ms, "
             f"mean={sum(durations)/len(durations):.0f} ms, "
             f"max={max(durations):.0f} ms"
         )
+        sections.append("DATA:\n" + "\n".join(lines))
 
-    # Pipeline config from saved pipeline
-    if _saved_pipeline:
-        cfg  = _saved_pipeline["config"]
-        le   = _saved_pipeline["label_encoder"]
-        cols = _saved_pipeline["selected_cols"]
-        parts.append(
-            f"Pipeline: cutoff={cfg['cutoff_hz']} Hz, "
-            f"window={cfg['window_ms']} ms, interpolation={cfg['interpolation']}"
+    # ── 4. Pipeline settings ───────────────────────────────────────────────────
+    pipe_lines: list = []
+
+    if pipeline_config:
+        # Use the live frontend state (most current — before training)
+        filt      = pipeline_config.get("filter", {})
+        norm      = pipeline_config.get("normalize", {})
+        feats_map = pipeline_config.get("features", {})
+        model_id  = pipeline_config.get("model", "auto")
+        selected  = [k for k, v in feats_map.items() if v]
+
+        pipe_lines.append(
+            f"Low-pass cutoff: {filt.get('cutoff', '?')} Hz  "
+            f"(order: {filt.get('order', '?')})"
         )
-        parts.append(f"Selected features: {cols[:6]}{'...' if len(cols) > 6 else ''}")
-        parts.append(f"Classes: {le.classes_.tolist()}")
+        pipe_lines.append(
+            f"Normalisation window: {norm.get('window', '?')} ms  "
+            f"(interpolation: {norm.get('interpolation', '?')})"
+        )
+        pipe_lines.append(
+            f"Selected features ({len(selected)}): "
+            f"{', '.join(selected) if selected else 'none selected'}"
+        )
+        pipe_lines.append(f"Model: {model_id}")
 
-    # Training results
+    elif _saved_pipeline:
+        # Fall back to post-training saved config
+        cfg  = _saved_pipeline["config"]
+        cols = _saved_pipeline["selected_cols"]
+        le   = _saved_pipeline["label_encoder"]
+        pipe_lines.append(
+            f"Low-pass cutoff: {cfg['cutoff_hz']} Hz  "
+            f"window: {cfg['window_ms']} ms  "
+            f"interpolation: {cfg['interpolation']}"
+        )
+        pipe_lines.append(
+            f"Feature columns ({len(cols)}): "
+            f"{', '.join(cols[:8])}{'...' if len(cols) > 8 else ''}"
+        )
+        pipe_lines.append(f"Classes (from training): {le.classes_.tolist()}")
+
+    if pipe_lines:
+        sections.append("PIPELINE CONFIG:\n" + "\n".join(pipe_lines))
+
+    # ── 5. Training results ────────────────────────────────────────────────────
     with _training_lock:
         tr = _training_status.get("results")
+
     if tr:
         best_id = tr.get("best_model_id", "")
         models  = tr.get("models", [])
-        best    = next((m for m in models if m["id"] == best_id), None)
+        clabs   = tr.get("class_labels", [])
+        cm      = tr.get("confusion_matrix", [])
+        lines   = []
+
+        # Best model + overfitting check
+        best = next((m for m in models if m["id"] == best_id), None)
         if best:
-            parts.append(
-                f"Best model: {best['name']} "
-                f"(CV accuracy: {best['cv_accuracy']*100:.1f}%, "
-                f"train accuracy: {best['accuracy']*100:.1f}%)"
+            gap = (best["accuracy"] - best["cv_accuracy"]) * 100
+            lines.append(
+                f"Best model: {best['name']}  "
+                f"CV accuracy: {best['cv_accuracy']*100:.1f}%  "
+                f"Train accuracy: {best['accuracy']*100:.1f}%"
             )
-        for m in models:
-            if m["id"] != best_id:
-                parts.append(
-                    f"  {m['name']}: CV={m['cv_accuracy']*100:.1f}%, "
-                    f"train={m['accuracy']*100:.1f}%"
+            if gap > 8:
+                lines.append(
+                    f"  ⚠ Overfitting: train is {gap:.0f} pp above CV — "
+                    f"model may not generalise. Collect more data or reduce features."
                 )
-        # Per-class confusion matrix breakdown
-        cm    = tr.get("confusion_matrix", [])
-        clabs = tr.get("class_labels", [])
+            elif gap <= 3:
+                lines.append(f"  ✓ Generalisation gap: {gap:.0f} pp — good.")
+
+        # All models ranked
+        if len(models) > 1:
+            lines.append("All models (ranked by CV accuracy):")
+            for m in sorted(models, key=lambda x: -x.get("cv_accuracy", 0)):
+                marker = " ← best" if m["id"] == best_id else ""
+                lines.append(
+                    f"  {m['name']}: CV={m['cv_accuracy']*100:.1f}%  "
+                    f"train={m['accuracy']*100:.1f}%{marker}"
+                )
+
+        # Per-class accuracy + confused pairs
         if cm and clabs:
-            parts.append("Confusion matrix per class:")
+            lines.append(f"Classes: {clabs}")
+            lines.append("Per-class accuracy:")
+            error_pairs: list = []
             for ri, (lbl, row) in enumerate(zip(clabs, cm)):
                 total   = sum(row)
                 correct = row[ri] if ri < len(row) else 0
                 if total > 0:
-                    parts.append(
-                        f"  '{lbl}': {correct}/{total} correct "
-                        f"({correct/total*100:.0f}%)"
+                    acc = correct / total * 100
+                    flag = "  ⚠ poor" if acc < 70 else ""
+                    lines.append(f"  '{lbl}': {correct}/{total} ({acc:.0f}%){flag}")
+                    for ci, count in enumerate(row):
+                        if ci != ri and count > 0 and ci < len(clabs):
+                            error_pairs.append((lbl, clabs[ci], count))
+
+            if error_pairs:
+                error_pairs.sort(key=lambda x: -x[2])
+                lines.append("Top confused pairs (actual → predicted as):")
+                for actual, predicted, count in error_pairs[:5]:
+                    lines.append(
+                        f"  '{actual}' → '{predicted}': "
+                        f"{count} time{'s' if count > 1 else ''}"
                     )
 
-    if not parts:
-        return "No project data available yet — user is in early setup."
+        sections.append("TRAINING RESULTS:\n" + "\n".join(lines))
 
-    return "\n".join(parts)
+    if not sections:
+        return "No project data available yet — user is in early setup phase."
+
+    return "\n\n".join(sections)
 
 
 def _parse_actions(text: str) -> list:
@@ -974,7 +1102,7 @@ def _strip_actions(text: str) -> str:
 
 @app.post("/copilot/chat")
 def copilot_chat(req: CopilotChatRequest):
-    context = _build_copilot_context(req.project_id)
+    context = _build_copilot_context(req.project_id, screen=req.screen, pipeline_config=req.pipeline_config)
     user_content = f"Project context:\n{context}\n\nUser question: {req.message}"
     try:
         response = client.messages.create(
