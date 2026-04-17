@@ -248,14 +248,55 @@ def analyze_signal(req: AnalyzeSignalRequest):
 class TrainRequest(BaseModel):
     project_id:        str
     cutoff_hz:         float       = 30.0
+    filter_type:       str         = "butterworth"   # butterworth | chebyshev | bessel | moving_average | none
     window_ms:         float       = 1000.0
-    interpolation:     str         = "cubic"
+    interpolation:     str         = "cubic"          # cubic | linear | none (skip)
     selected_features: List[str]   = []
-    model_type:        str         = "auto"    # auto | rf | svm | nn
+    model_type:        str         = "auto"           # auto | rf | svm | nn
+
+
+def _apply_filter(df: pd.DataFrame, filter_type: str, cutoff_hz: float) -> pd.DataFrame:
+    """Apply the selected filter type to signal columns in df."""
+    from scipy.signal import cheby1, bessel, sosfilt, butter
+    from scipy.ndimage import uniform_filter1d
+
+    if filter_type == "none":
+        return df
+
+    safe_cutoff = max(1.0, min(float(cutoff_hz), SAMPLE_RATE_HZ * 0.45))
+    nyq = SAMPLE_RATE_HZ / 2.0
+    norm = safe_cutoff / nyq
+    order = 4
+    sig_cols = [c for c in ["a_x", "a_y", "a_z"] if c in df.columns]
+
+    result = df.copy()
+    for col in sig_cols:
+        arr = df[col].to_numpy(dtype=float)
+        if len(arr) < 20:
+            continue
+        try:
+            if filter_type == "butterworth":
+                sos = butter(order, norm, btype="low", analog=False, output="sos")
+                result[col] = sosfilt(sos, arr)
+            elif filter_type == "chebyshev":
+                sos = cheby1(order, 0.5, norm, btype="low", analog=False, output="sos")
+                result[col] = sosfilt(sos, arr)
+            elif filter_type == "bessel":
+                sos = bessel(order, norm, btype="low", analog=False, output="sos", norm="phase")
+                result[col] = sosfilt(sos, arr)
+            elif filter_type == "moving_average":
+                # Window = sample_rate / cutoff gives ~half-power at cutoff
+                win = max(2, int(round(SAMPLE_RATE_HZ / safe_cutoff)))
+                result[col] = uniform_filter1d(arr, size=win, mode="nearest")
+        except Exception:
+            pass  # leave column unchanged on any filter failure
+
+    return result
 
 
 def _preprocess_event(ev: EventData, cutoff_hz: float,
-                      window_ms: float, interpolation: str) -> pd.DataFrame:
+                      window_ms: float, interpolation: str,
+                      filter_type: str = "butterworth") -> pd.DataFrame:
     n = len(ev.ax)
     df = pd.DataFrame({
         "timestamp": [DT_US] * n,
@@ -264,19 +305,19 @@ def _preprocess_event(ev: EventData, cutoff_hz: float,
         "a_z": ev.az if ev.az else [0.0] * n,
     })
 
-    # Butterworth low-pass (clamp cutoff to safe range)
-    safe_cutoff = max(1.0, min(float(cutoff_hz), SAMPLE_RATE_HZ * 0.45))
-    if n >= 20:
+    # Apply filter (or skip if filter_type == "none")
+    if n >= 20 and filter_type != "none":
         try:
-            df = butter_lowpass_filter_df(df, fs=SAMPLE_RATE_HZ, cutoff=safe_cutoff)
+            df = _apply_filter(df, filter_type, cutoff_hz)
         except Exception:
             pass
 
-    # Normalize to target window length
-    try:
-        df = normalize_df_period(window_ms, DT_US, df, interpolationKind=interpolation)
-    except Exception:
-        pass
+    # Normalize to target window length (skip if interpolation == "none")
+    if interpolation != "none":
+        try:
+            df = normalize_df_period(window_ms, DT_US, df, interpolationKind=interpolation)
+        except Exception:
+            pass
 
     return df
 
@@ -366,7 +407,7 @@ def _run_training(req: TrainRequest, events: List[EventData]):
             if not ev.ax:
                 continue
             try:
-                df = _preprocess_event(ev, req.cutoff_hz, req.window_ms, req.interpolation)
+                df = _preprocess_event(ev, req.cutoff_hz, req.window_ms, req.interpolation, req.filter_type)
                 df["event_id"] = len(processed)
                 processed.append(df)
                 labels.append(ev.class_label or "unknown")
@@ -440,6 +481,7 @@ def _run_training(req: TrainRequest, events: List[EventData]):
             "selected_cols": selected_cols,
             "config": {
                 "cutoff_hz":     req.cutoff_hz,
+                "filter_type":   req.filter_type,
                 "window_ms":     req.window_ms,
                 "interpolation": req.interpolation,
             },
@@ -519,7 +561,8 @@ def _do_classify(ev: EventData) -> dict:
     cfg = _saved_pipeline["config"]
 
     # Preprocess
-    df = _preprocess_event(ev, cfg["cutoff_hz"], cfg["window_ms"], cfg["interpolation"])
+    df = _preprocess_event(ev, cfg["cutoff_hz"], cfg["window_ms"], cfg["interpolation"],
+                           cfg.get("filter_type", "butterworth"))
     df["event_id"] = 0
 
     # Time-domain features
