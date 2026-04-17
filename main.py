@@ -98,12 +98,14 @@ def ping():
 # ── /project/create ───────────────────────────────────────────────────────────
 
 class ProjectConfig(BaseModel):
-    name: str
-    sensor_type: str
-    connection_type: str
-    trigger_type: str
-    trigger_config: dict
-    target_mcu: str
+    name:                    str
+    sensor_type:             str
+    connection_type:         str
+    trigger_type:            str
+    trigger_config:          dict
+    target_mcu:              str
+    application_description: Optional[str]  = None
+    hardware_preprocessing:  Optional[dict] = None
 
 
 @app.post("/project/create")
@@ -872,6 +874,13 @@ COPILOT_SYSTEM = (
 )
 
 
+class PipelineDesignRequest(BaseModel):
+    project_id:               str
+    application_description:  str
+    hardware_preprocessing:   Optional[dict] = None
+    signal_analysis:          Optional[dict] = None
+
+
 class CopilotChatRequest(BaseModel):
     message:         str
     project_id:      str
@@ -928,6 +937,17 @@ def _build_copilot_context(
             f"Target MCU: {proj.get('target_mcu', 'unknown')}",
             f"Connection: {proj.get('connection_type', 'unknown')}",
         ]
+        app_desc = proj.get("application_description") or ""
+        if app_desc:
+            lines.append(f"Application context: {app_desc}")
+        hw = proj.get("hardware_preprocessing") or {}
+        if hw.get("type") and hw["type"] != "none":
+            hw_str = hw["type"]
+            if hw.get("cutoff_hz"):
+                hw_str += f" at {hw['cutoff_hz']} Hz"
+            elif hw.get("description"):
+                hw_str += f": {hw['description']}"
+            lines.append(f"Hardware preprocessing on chip: {hw_str}")
         sections.append("PROJECT:\n" + "\n".join(lines))
 
     # ── 3. Data quality ────────────────────────────────────────────────────────
@@ -1098,6 +1118,102 @@ def _parse_actions(text: str) -> list:
 
 def _strip_actions(text: str) -> str:
     return re.sub(r'\[ACTION:[^\]]+\]', '', text).strip()
+
+
+PIPELINE_DESIGN_SYSTEM = (
+    "You are an expert signal processing engineer with deep domain knowledge across "
+    "industrial vibration analysis, medical wearables, sports biomechanics, and embedded systems. "
+    "Design the optimal signal processing pipeline for the given application and signal data.\n\n"
+    "Respond ONLY with valid JSON, no other text:\n"
+    "{\n"
+    '  "reasoning": "overall approach for this domain",\n'
+    '  "filter": {\n'
+    '    "type": "butterworth",\n'
+    '    "cutoff_hz": 24.8,\n'
+    '    "order": 4,\n'
+    '    "skip": false,\n'
+    '    "skip_reason": "only include if skip is true",\n'
+    '    "reasoning": "domain-specific reason"\n'
+    '  },\n'
+    '  "normalize": {\n'
+    '    "window_ms": 800,\n'
+    '    "interpolation": "cubic",\n'
+    '    "reasoning": "why this window for this application"\n'
+    '  },\n'
+    '  "features": {\n'
+    '    "time_domain": ["rms", "peak", "std_dev", "kurtosis"],\n'
+    '    "frequency_domain": ["fft_energy", "dominant_freq"],\n'
+    '    "reasoning": "why these features for this domain"\n'
+    '  },\n'
+    '  "model": {\n'
+    '    "type": "random_forest",\n'
+    '    "reasoning": "why this model for this dataset"\n'
+    '  }\n'
+    "}\n\n"
+    "Available time-domain feature IDs (use exactly): mean, std_dev, rms, peak, absolute_max\n"
+    "Available frequency-domain feature IDs (use exactly): fft_energy, dominant_freq, kurtosis\n"
+    "Available model types: random_forest, svm, nn, auto\n\n"
+    "Domain knowledge to apply:\n"
+    "- Bearing fault detection: kurtosis is critical (impulsive faults), use fft_energy and dominant_freq for frequency signatures\n"
+    "- Gait analysis: longer windows (1500-3000ms), rms and std_dev for symmetry, mean for DC offset\n"
+    "- Impact classification: peak and absolute_max for amplitude, kurtosis for impulsiveness, rms for energy\n"
+    "- Gesture recognition: shorter windows (200-600ms), std_dev and rms, all axes important\n"
+    "- Tool wear / machining: kurtosis trend (increases with wear), fft_energy for chatter frequency\n"
+    "If hardware preprocessing already applied (e.g. hardware lowpass at X Hz), set filter.skip=true "
+    "if X Hz is already appropriately bandlimiting the signal, or recommend a complementary software filter."
+)
+
+_ai_pipeline_designs: Dict[str, dict] = {}
+
+
+@app.post("/pipeline/design")
+def pipeline_design(req: PipelineDesignRequest):
+    hw      = req.hardware_preprocessing or {}
+    hw_type = hw.get("type", "none")
+    hw_desc = {
+        "none":     "None",
+        "lowpass":  f"Hardware lowpass at {hw.get('cutoff_hz', '?')} Hz",
+        "highpass": f"Hardware highpass at {hw.get('cutoff_hz', '?')} Hz",
+        "custom":   hw.get("description", "Custom (undescribed)"),
+    }.get(hw_type, "None")
+
+    sa = req.signal_analysis or {}
+    sig_parts: list = []
+    if sa.get("sample_rate_hz"):
+        sig_parts.append(f"Sample rate: {sa['sample_rate_hz']} Hz (Nyquist: {sa['sample_rate_hz']/2:.1f} Hz)")
+    if sa.get("recommended_cutoff_hz"):
+        sig_parts.append(f"Recommended cutoff (90% energy): {sa['recommended_cutoff_hz']} Hz")
+    if sa.get("recommended_window_ms"):
+        sig_parts.append(f"Recommended normalisation window: {sa['recommended_window_ms']} ms")
+    if sa.get("event_count"):
+        sig_parts.append(f"Events collected: {sa['event_count']}")
+
+    user_content = (
+        f"Application description: {req.application_description}\n\n"
+        f"Hardware preprocessing on chip: {hw_desc}\n\n"
+        "Signal analysis data:\n"
+        + ("\n".join(sig_parts) if sig_parts else "Not yet available — design based on application description only.")
+        + "\n\nDesign the optimal signal processing pipeline for this application."
+    )
+
+    try:
+        resp = client.messages.create(
+            model      = "claude-sonnet-4-5",
+            max_tokens = 1024,
+            system     = PIPELINE_DESIGN_SYSTEM,
+            messages   = [{"role": "user", "content": user_content}],
+        )
+        raw = resp.content[0].text.strip()
+        # Strip markdown fences if model wraps in ```json ... ```
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw.strip())
+        design = json_lib.loads(raw)
+        _ai_pipeline_designs[req.project_id] = design
+        return design
+    except json_lib.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/copilot/chat")
