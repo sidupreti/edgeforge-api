@@ -253,6 +253,105 @@ class TrainRequest(BaseModel):
     interpolation:     str         = "cubic"          # cubic | linear | none (skip)
     selected_features: List[str]   = []
     model_type:        str         = "auto"           # auto | rf | svm | nn
+    custom_blocks:     Optional[List[dict]] = []      # list of {id, name, code} for custom/standard blocks
+
+
+# ── Custom block execution ────────────────────────────────────────────────────
+
+STANDARD_BLOCK_CODE: Dict[str, str] = {
+    "bandpass": """\
+from scipy.signal import butter, sosfilt
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+low_norm  = max(0.01, min(1.0 / (SAMPLE_RATE_HZ / 2.0), 0.49))
+high_norm = max(low_norm + 0.01, min(30.0 / (SAMPLE_RATE_HZ / 2.0), 0.49))
+sos = butter(4, [low_norm, high_norm], btype='band', output='sos')
+for col in sig_cols:
+    arr = df[col].to_numpy(dtype=float)
+    if len(arr) >= 20:
+        df[col] = sosfilt(sos, arr)
+""",
+    "envelope": """\
+from scipy.signal import hilbert
+import numpy as np
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+for col in sig_cols:
+    arr = df[col].to_numpy(dtype=float)
+    if len(arr) >= 4:
+        df[col] = np.abs(hilbert(arr))
+""",
+    "derivative": """\
+import numpy as np
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+for col in sig_cols:
+    arr = df[col].to_numpy(dtype=float)
+    df[col] = np.gradient(arr)
+""",
+    "zscore": """\
+import numpy as np
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+for col in sig_cols:
+    arr = df[col].to_numpy(dtype=float)
+    mu, sigma = arr.mean(), arr.std()
+    if sigma > 1e-9:
+        df[col] = (arr - mu) / sigma
+""",
+    "peak_detector": """\
+from scipy.signal import find_peaks
+import numpy as np
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+for col in sig_cols:
+    arr = df[col].to_numpy(dtype=float)
+    peaks, _ = find_peaks(np.abs(arr), height=0.1 * np.max(np.abs(arr)))
+    indicator = np.zeros_like(arr)
+    indicator[peaks] = 1.0
+    df[col] = indicator
+""",
+    "fft_transform": """\
+import numpy as np
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+for col in sig_cols:
+    arr = df[col].to_numpy(dtype=float)
+    mag = np.abs(np.fft.rfft(arr, n=len(arr)))
+    # Pad/trim back to original length
+    result = np.zeros(len(arr))
+    half = len(mag)
+    result[:half] = mag[:half]
+    df[col] = result
+""",
+    "abs_smooth": """\
+from scipy.ndimage import uniform_filter1d
+import numpy as np
+sig_cols = [c for c in ['a_x', 'a_y', 'a_z'] if c in df.columns]
+for col in sig_cols:
+    arr = np.abs(df[col].to_numpy(dtype=float))
+    df[col] = uniform_filter1d(arr, size=5, mode='nearest')
+""",
+}
+
+
+def run_custom_block(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """Execute a custom processing block; returns (possibly mutated) df."""
+    from scipy.signal import filtfilt, hilbert, find_peaks
+    from scipy.ndimage import uniform_filter1d
+
+    namespace = {
+        "df":               df.copy(),
+        "np":               np,
+        "pd":               pd,
+        "SAMPLE_RATE_HZ":   SAMPLE_RATE_HZ,
+        "filtfilt":         filtfilt,
+        "hilbert":          hilbert,
+        "find_peaks":       find_peaks,
+        "uniform_filter1d": uniform_filter1d,
+    }
+    try:
+        exec(compile(code, "<custom_block>", "exec"), namespace)  # noqa: S102
+        result = namespace.get("df", df)
+        if isinstance(result, pd.DataFrame):
+            return result
+    except Exception:
+        pass  # silently skip broken custom block
+    return df
 
 
 def _apply_filter(df: pd.DataFrame, filter_type: str, cutoff_hz: float) -> pd.DataFrame:
@@ -296,7 +395,8 @@ def _apply_filter(df: pd.DataFrame, filter_type: str, cutoff_hz: float) -> pd.Da
 
 def _preprocess_event(ev: EventData, cutoff_hz: float,
                       window_ms: float, interpolation: str,
-                      filter_type: str = "butterworth") -> pd.DataFrame:
+                      filter_type: str = "butterworth",
+                      custom_blocks: Optional[List[dict]] = None) -> pd.DataFrame:
     n = len(ev.ax)
     df = pd.DataFrame({
         "timestamp": [DT_US] * n,
@@ -318,6 +418,12 @@ def _preprocess_event(ev: EventData, cutoff_hz: float,
             df = normalize_df_period(window_ms, DT_US, df, interpolationKind=interpolation)
         except Exception:
             pass
+
+    # Run any custom / standard pipeline blocks
+    for block in (custom_blocks or []):
+        code = block.get("code", "")
+        if code:
+            df = run_custom_block(df, code)
 
     return df
 
@@ -407,7 +513,7 @@ def _run_training(req: TrainRequest, events: List[EventData]):
             if not ev.ax:
                 continue
             try:
-                df = _preprocess_event(ev, req.cutoff_hz, req.window_ms, req.interpolation, req.filter_type)
+                df = _preprocess_event(ev, req.cutoff_hz, req.window_ms, req.interpolation, req.filter_type, req.custom_blocks or [])
                 df["event_id"] = len(processed)
                 processed.append(df)
                 labels.append(ev.class_label or "unknown")
@@ -484,6 +590,7 @@ def _run_training(req: TrainRequest, events: List[EventData]):
                 "filter_type":   req.filter_type,
                 "window_ms":     req.window_ms,
                 "interpolation": req.interpolation,
+                "custom_blocks": req.custom_blocks or [],
             },
         }
 
@@ -562,7 +669,8 @@ def _do_classify(ev: EventData) -> dict:
 
     # Preprocess
     df = _preprocess_event(ev, cfg["cutoff_hz"], cfg["window_ms"], cfg["interpolation"],
-                           cfg.get("filter_type", "butterworth"))
+                           cfg.get("filter_type", "butterworth"),
+                           cfg.get("custom_blocks", []))
     df["event_id"] = 0
 
     # Time-domain features
@@ -1257,6 +1365,63 @@ def pipeline_design(req: PipelineDesignRequest):
         raise HTTPException(status_code=500, detail=f"AI returned invalid JSON: {exc}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── /pipeline/custom-block ────────────────────────────────────────────────────
+
+CUSTOM_BLOCK_SYSTEM = (
+    "You are an expert signal processing engineer. Generate a Python code snippet that "
+    "transforms an IMU/sensor DataFrame `df` in-place. "
+    "The DataFrame has columns: timestamp, a_x, a_y, a_z (float64). "
+    "Modify the signal columns directly on df (e.g. df['a_x'] = ...). "
+    "Available imports already in scope: np (numpy), pd (pandas), SAMPLE_RATE_HZ (float), "
+    "filtfilt, hilbert, find_peaks (scipy.signal), uniform_filter1d (scipy.ndimage). "
+    "Do NOT import these — they are already available. "
+    "Do NOT add any markdown fences, explanation, or comments. "
+    "Output ONLY the raw Python code that modifies df. "
+    "Keep it concise (under 20 lines). "
+    "The code must work with typical IMU data (accelerometer, 100 Hz sample rate)."
+)
+
+
+class CustomBlockRequest(BaseModel):
+    description: str
+    project_id:  str
+
+
+class StandardBlockRequest(BaseModel):
+    block_type: str   # bandpass | envelope | derivative | zscore | peak_detector | fft_transform | abs_smooth
+
+
+@app.post("/pipeline/custom-block")
+def generate_custom_block(req: CustomBlockRequest):
+    """Use Claude to generate Python processing code from a description."""
+    try:
+        resp = client.messages.create(
+            model      = "claude-sonnet-4-5",
+            max_tokens = 512,
+            system     = CUSTOM_BLOCK_SYSTEM,
+            messages   = [{"role": "user", "content": f"Generate a pipeline block that: {req.description}"}],
+        )
+        code = resp.content[0].text.strip()
+        # Strip accidental markdown fences
+        code = re.sub(r"^```[a-z]*\n?", "", code)
+        code = re.sub(r"\n?```$", "", code.strip())
+        return {"code": code}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/pipeline/standard-block")
+def get_standard_block(req: StandardBlockRequest):
+    """Return pre-written code for a standard block type."""
+    code = STANDARD_BLOCK_CODE.get(req.block_type)
+    if code is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown block type '{req.block_type}'. Available: {list(STANDARD_BLOCK_CODE.keys())}",
+        )
+    return {"code": code}
 
 
 @app.post("/copilot/chat")
