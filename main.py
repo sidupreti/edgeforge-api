@@ -1011,6 +1011,434 @@ def export_efp(project_id: str):
     )
 
 
+# ── C header export ───────────────────────────────────────────────────────────
+
+def _c_float_arr(name: str, vals, per_line: int = 6) -> str:
+    vals = [float(v) for v in vals]
+    n    = len(vals)
+    lines = [f"static const float {name}[{n}] = {{"]
+    for i in range(0, n, per_line):
+        chunk  = vals[i:i + per_line]
+        row    = ", ".join(f"{v:.8g}f" for v in chunk)
+        comma  = "" if i + per_line >= n else ","
+        lines.append(f"    {row}{comma}")
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def _c_int_arr(name: str, vals, per_line: int = 10) -> str:
+    vals = [int(v) for v in vals]
+    n    = len(vals)
+    lines = [f"static const int {name}[{n}] = {{"]
+    for i in range(0, n, per_line):
+        chunk  = vals[i:i + per_line]
+        row    = ", ".join(str(v) for v in chunk)
+        comma  = "" if i + per_line >= n else ","
+        lines.append(f"    {row}{comma}")
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def _rf_c_arrays(clf, n_feat: int, max_trees: int = 8) -> str:
+    try:
+        from sklearn.tree._tree import TREE_UNDEFINED
+    except ImportError:
+        TREE_UNDEFINED = -2
+    trees   = clf.estimators_[:max_trees]
+    n_trees = len(trees)
+    parts   = []
+    for k, dt in enumerate(trees):
+        t = dt.tree_
+        feat_arr = []; thresh_arr = []; left_arr = []; right_arr = []; pred_arr = []
+        for i in range(t.node_count):
+            feat_arr.append(int(t.feature[i]))
+            thresh_arr.append(float(t.threshold[i]))
+            left_arr.append(int(t.children_left[i]))
+            right_arr.append(int(t.children_right[i]))
+            pred_arr.append(int(np.argmax(t.value[i][0])) if t.feature[i] == TREE_UNDEFINED else -1)
+        parts.append(_c_int_arr(f"EF_T{k}_FEAT",  feat_arr,   12))
+        parts.append(_c_float_arr(f"EF_T{k}_THR", thresh_arr,  6))
+        parts.append(_c_int_arr(f"EF_T{k}_LEFT",  left_arr,   12))
+        parts.append(_c_int_arr(f"EF_T{k}_RIGHT", right_arr,  12))
+        parts.append(_c_int_arr(f"EF_T{k}_PRED",  pred_arr,   12))
+    funcs = []
+    for k in range(n_trees):
+        funcs.append(
+            f"static int8_t ef_tree_{k}(const float *x) {{\n"
+            f"    int n = 0;\n"
+            f"    while (EF_T{k}_FEAT[n] != {TREE_UNDEFINED}) {{\n"
+            f"        n = (x[EF_T{k}_FEAT[n]] <= EF_T{k}_THR[n])"
+            f" ? EF_T{k}_LEFT[n] : EF_T{k}_RIGHT[n];\n"
+            f"    }}\n"
+            f"    return (int8_t)EF_T{k}_PRED[n];\n"
+            f"}}"
+        )
+    calls    = " ".join(f"votes[ef_tree_{k}(x)]++;" for k in range(n_trees))
+    vote_fn  = (
+        f"static int8_t ef_rf_predict(const float *x) {{\n"
+        f"    int votes[EF_N_CLASSES] = {{0}}, i;\n"
+        f"    {calls}\n"
+        f"    int best = 0;\n"
+        f"    for (i = 1; i < EF_N_CLASSES; i++) if (votes[i] > votes[best]) best = i;\n"
+        f"    return (int8_t)best;\n"
+        f"}}"
+    )
+    return "\n\n".join(parts) + "\n\n" + "\n\n".join(funcs) + "\n\n" + vote_fn
+
+
+def _svm_c_arrays(clf, n_feat: int, n_classes: int) -> str:
+    sv        = clf.support_vectors_
+    dc        = clf.dual_coef_
+    intercept = clf.intercept_
+    n_sv      = sv.shape[0]
+    if isinstance(clf.gamma, (int, float)):
+        gamma_val = float(clf.gamma)
+    elif hasattr(clf, "_gamma"):
+        gamma_val = float(clf._gamma)
+    else:
+        gamma_val = 1.0 / max(n_feat, 1)
+    parts = [
+        f"#define EF_SVM_N_SV {n_sv}",
+        f"#define EF_SVM_GAMMA {gamma_val:.8g}f",
+        _c_int_arr("EF_SVM_N_SUPPORT",  clf.n_support_,  10),
+        _c_float_arr("EF_SVM_SV",        sv.flatten(),    6),
+        _c_float_arr("EF_SVM_DUAL_COEF", dc.flatten(),    6),
+        _c_float_arr("EF_SVM_INTERCEPT", intercept,       6),
+    ]
+    infer_fn = """\
+static int8_t ef_svm_predict(const float *x) {
+    float K[EF_SVM_N_SV];
+    int i, j, k;
+    for (i = 0; i < EF_SVM_N_SV; i++) {
+        float d = 0.0f;
+        for (j = 0; j < EF_N_FEATURES; j++) {
+            float diff = x[j] - EF_SVM_SV[i * EF_N_FEATURES + j];
+            d += diff * diff;
+        }
+        K[i] = expf(-EF_SVM_GAMMA * d);
+    }
+    int votes[EF_N_CLASSES] = {0};
+    int pair = 0, sv_i = 0;
+    for (i = 0; i < EF_N_CLASSES; i++) {
+        int tmp_j = sv_i + EF_SVM_N_SUPPORT[i];
+        for (j = i + 1; j < EF_N_CLASSES; j++) {
+            float val = EF_SVM_INTERCEPT[pair];
+            for (k = sv_i; k < sv_i + EF_SVM_N_SUPPORT[i]; k++)
+                val += EF_SVM_DUAL_COEF[(j - 1) * EF_SVM_N_SV + k] * K[k];
+            for (k = tmp_j; k < tmp_j + EF_SVM_N_SUPPORT[j]; k++)
+                val += EF_SVM_DUAL_COEF[i * EF_SVM_N_SV + k] * K[k];
+            if (val > 0.0f) votes[i]++; else votes[j]++;
+            tmp_j += EF_SVM_N_SUPPORT[j];
+            pair++;
+        }
+        sv_i += EF_SVM_N_SUPPORT[i];
+    }
+    int best = 0;
+    for (i = 1; i < EF_N_CLASSES; i++) if (votes[i] > votes[best]) best = i;
+    return (int8_t)best;
+}"""
+    return "\n".join(parts) + "\n\n" + infer_fn
+
+
+def _nn_c_arrays(clf, n_feat: int, n_classes: int) -> str:
+    layer_sizes = [n_feat] + list(clf.hidden_layer_sizes) + [n_classes]
+    parts       = []
+    for k, (W, b) in enumerate(zip(clf.coefs_, clf.intercepts_)):
+        parts.append(_c_float_arr(f"EF_NN_W{k}", W.flatten(), 8))
+        parts.append(_c_float_arr(f"EF_NN_B{k}", b,           8))
+    n_layers = len(clf.coefs_)
+    lines    = ["static int8_t ef_nn_predict(const float *x) {"]
+    for k, sz in enumerate(layer_sizes[1:]):
+        lines.append(f"    float h{k}[{sz}];")
+    lines.append("    int i, j;")
+    for k in range(n_layers):
+        in_sz   = layer_sizes[k]
+        out_sz  = layer_sizes[k + 1]
+        in_var  = "x" if k == 0 else f"h{k - 1}"
+        out_var = f"h{k}"
+        is_last = (k == n_layers - 1)
+        lines.append(f"    for (j = 0; j < {out_sz}; j++) {{")
+        lines.append(f"        float s = EF_NN_B{k}[j];")
+        lines.append(f"        for (i = 0; i < {in_sz}; i++) s += {in_var}[i] * EF_NN_W{k}[i * {out_sz} + j];")
+        if is_last:
+            lines.append(f"        {out_var}[j] = s;")
+        else:
+            lines.append(f"        {out_var}[j] = s > 0.0f ? s : 0.0f;  /* ReLU */")
+        lines.append("    }")
+    last_h = f"h{n_layers - 1}"
+    lines += [
+        "    int best = 0;",
+        f"    for (i = 1; i < EF_N_CLASSES; i++) if ({last_h}[i] > {last_h}[best]) best = i;",
+        "    return (int8_t)best;",
+        "}",
+    ]
+    return "\n\n".join(parts) + "\n\n" + "\n".join(lines)
+
+
+def _c_math_helpers() -> str:
+    return r"""static float ef_mean(const float *x, int n) {
+    float s = 0.0f; int i;
+    for (i = 0; i < n; i++) s += x[i];
+    return s / n;
+}
+static float ef_std(const float *x, int n) {
+    float mu = ef_mean(x, n), s = 0.0f; int i;
+    for (i = 0; i < n; i++) { float d = x[i] - mu; s += d * d; }
+    return sqrtf(s / n);
+}
+static float ef_rms(const float *x, int n) {
+    float s = 0.0f; int i;
+    for (i = 0; i < n; i++) s += x[i] * x[i];
+    return sqrtf(s / n);
+}
+static float ef_peak(const float *x, int n) {
+    float m = x[0]; int i;
+    for (i = 1; i < n; i++) if (x[i] > m) m = x[i];
+    return m;
+}
+static float ef_abs_max(const float *x, int n) {
+    float m = fabsf(x[0]); int i;
+    for (i = 1; i < n; i++) { float a = fabsf(x[i]); if (a > m) m = a; }
+    return m;
+}
+/* FFT energy via Parseval: sum(|FFT(x)|^2) == n * sum(x^2) */
+static float ef_fft_energy(const float *x, int n) {
+    float s = 0.0f; int i;
+    for (i = 0; i < n; i++) s += x[i] * x[i];
+    return s * n;
+}
+/* Dominant frequency via DFT magnitude search (O(n^2)) */
+static float ef_dom_freq(const float *x, int n) {
+    float max_p = 0.0f; int max_k = 1, k, t;
+    for (k = 1; k <= n / 2; k++) {
+        float re = 0.0f, im = 0.0f, a;
+        for (t = 0; t < n; t++) {
+            a = 6.28318530f * k * t / n;
+            re += x[t] * cosf(a); im -= x[t] * sinf(a);
+        }
+        float p = re * re + im * im;
+        if (p > max_p) { max_p = p; max_k = k; }
+    }
+    return (float)max_k * EF_SAMPLE_RATE_HZ / n;
+}
+/* Excess kurtosis — matches scipy.stats.kurtosis(bias=True) */
+static float ef_kurtosis(const float *x, int n) {
+    float mu = ef_mean(x, n), var = 0.0f, m4 = 0.0f; int i;
+    for (i = 0; i < n; i++) {
+        float d = x[i] - mu, d2 = d * d;
+        var += d2; m4 += d2 * d2;
+    }
+    var /= n; m4 /= n;
+    if (var < 1e-10f) return 0.0f;
+    return m4 / (var * var) - 3.0f;
+}"""
+
+
+def _c_filter_fn() -> str:
+    return r"""/* IIR low-pass — Direct Form II Transposed, order 4 */
+static float ef_flt_state[3][4];
+static void ef_filter_reset(void) { memset(ef_flt_state, 0, sizeof(ef_flt_state)); }
+static void ef_filter_axis(const float *in, float *out, int n, float *s) {
+    int i;
+    for (i = 0; i < n; i++) {
+        float x = in[i];
+        float y = EF_FILTER_B[0] * x + s[0];
+        s[0] = EF_FILTER_B[1] * x - EF_FILTER_A[1] * y + s[1];
+        s[1] = EF_FILTER_B[2] * x - EF_FILTER_A[2] * y + s[2];
+        s[2] = EF_FILTER_B[3] * x - EF_FILTER_A[3] * y + s[3];
+        s[3] = EF_FILTER_B[4] * x - EF_FILTER_A[4] * y;
+        out[i] = y;
+    }
+}"""
+
+
+def _c_feature_fn(selected_cols) -> str:
+    axis_map = {"a_x": "ax", "a_y": "ay", "a_z": "az"}
+    feat_map = {
+        "mean":         "ef_mean({a}, n)",
+        "std_dev":      "ef_std({a}, n)",
+        "rms":          "ef_rms({a}, n)",
+        "peak":         "ef_peak({a}, n)",
+        "absolute_max": "ef_abs_max({a}, n)",
+        "fft_energy":   "ef_fft_energy({a}, n)",
+        "dominant_freq":"ef_dom_freq({a}, n)",
+        "kurtosis":     "ef_kurtosis({a}, n)",
+    }
+    lines = [
+        "static void ef_extract_features(",
+        "    const float *ax, const float *ay, const float *az, int n, float *feat) {",
+    ]
+    for idx, col in enumerate(selected_cols):
+        parts = col.split("__", 1)
+        if len(parts) == 2 and parts[0] in axis_map and parts[1] in feat_map:
+            expr = feat_map[parts[1]].replace("{a}", axis_map[parts[0]])
+            lines.append(f"    feat[{idx}] = {expr};  /* {col} */")
+        else:
+            lines.append(f"    feat[{idx}] = 0.0f;  /* unknown: {col} */")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _c_scale_fn(scaler, n_feat: int) -> str:
+    safe_scale = [float(s) if abs(float(s)) > 1e-10 else 1.0 for s in scaler.scale_]
+    return "\n".join([
+        _c_float_arr("EF_SCALER_MEAN",  scaler.mean_, 8),
+        _c_float_arr("EF_SCALER_SCALE", safe_scale,   8),
+        "",
+        "static void ef_scale(float *feat) {",
+        "    int i;",
+        "    for (i = 0; i < EF_N_FEATURES; i++)",
+        "        feat[i] = (feat[i] - EF_SCALER_MEAN[i]) / EF_SCALER_SCALE[i];",
+        "}",
+    ])
+
+
+def _generate_c_header(project_id: str, chip: str = "generic") -> str:
+    from scipy.signal import butter as _butter
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
+
+    if _saved_pipeline is None:
+        raise HTTPException(status_code=400, detail="No trained model. Run /train first.")
+
+    pipe      = _saved_pipeline
+    clf       = pipe["classifier"]
+    scaler    = pipe["scaler"]
+    le        = pipe["label_encoder"]
+    sel       = pipe["selected_cols"]
+    cfg       = pipe["config"]
+    classes   = le.classes_.tolist()
+    n_classes = len(classes)
+    n_feat    = len(sel)
+    cutoff    = float(cfg["cutoff_hz"])
+    window_ms = float(cfg["window_ms"])
+    n_samples = max(2, int(window_ms * SAMPLE_RATE_HZ / 1000))
+
+    nyq  = SAMPLE_RATE_HZ / 2.0
+    b, a = _butter(4, min(cutoff, nyq * 0.95) / nyq, btype="low")
+
+    if isinstance(clf, RandomForestClassifier):
+        model_type  = "Random Forest"
+        n_trees     = min(8, len(clf.estimators_))
+        model_sec   = (
+            f"/* RF: first {n_trees} of {len(clf.estimators_)} trees */\n"
+            + _rf_c_arrays(clf, n_feat, n_trees)
+        )
+        predict_call = "ef_rf_predict(feat)"
+    elif isinstance(clf, SVC):
+        n_sv = clf.support_vectors_.shape[0]
+        model_type  = "SVM (RBF kernel)"
+        model_sec   = (
+            f"/* SVM: {n_sv} support vectors, OVO voting */\n"
+            + _svm_c_arrays(clf, n_feat, n_classes)
+        )
+        predict_call = "ef_svm_predict(feat)"
+    elif isinstance(clf, MLPClassifier):
+        layers      = [n_feat] + list(clf.hidden_layer_sizes) + [n_classes]
+        model_type  = f"Neural Network {layers}"
+        model_sec   = _nn_c_arrays(clf, n_feat, n_classes)
+        predict_call = "ef_nn_predict(feat)"
+    else:
+        raise HTTPException(status_code=500, detail=f"Unknown model type: {type(clf)}")
+
+    chip_notes = {
+        "esp32":   "Target: ESP32 — IRAM_ATTR on hot paths recommended",
+        "stm32":   "Target: STM32 — consider CMSIS-DSP for ef_dom_freq",
+        "nrf":     "Target: nRF52 — consider CMSIS-DSP for ef_dom_freq",
+        "arduino": "Target: Arduino Nano 33 BLE (nRF52840)",
+        "rp2040":  "Target: Raspberry Pi Pico (RP2040)",
+        "generic": "Target: generic ARM Cortex-M / embedded C99",
+    }
+    chip_note  = chip_notes.get(chip, f"Target: {chip}")
+    class_list = ", ".join(f'"{c}"' for c in classes)
+    date_str   = time.strftime("%Y-%m-%d")
+
+    header = (
+        f"/*\n"
+        f" * EdgeForge — auto-generated on-device classifier\n"
+        f" * -----------------------------------------------\n"
+        f" * Project  : {project_id}\n"
+        f" * Model    : {model_type}\n"
+        f" * Classes  : {classes}\n"
+        f" * Features : {n_feat}\n"
+        f" * Generated: {date_str}\n"
+        f" * {chip_note}\n"
+        f" *\n"
+        f" * Usage\n"
+        f" * -----\n"
+        f" *   #include \"classifier.h\"\n"
+        f" *   int8_t idx = ef_classify(ax, ay, az, EF_WINDOW_SAMPLES);\n"
+        f" *   const char *label = EF_CLASSES[idx];\n"
+        f" */\n\n"
+        f"#pragma once\n"
+        f"#include <stdint.h>\n"
+        f"#include <math.h>\n"
+        f"#include <string.h>\n\n"
+        f"/* ── Pipeline config ─────────────────────────────────────────────── */\n"
+        f"#define EF_SAMPLE_RATE_HZ  {int(SAMPLE_RATE_HZ)}\n"
+        f"#define EF_CUTOFF_HZ       {int(cutoff)}\n"
+        f"#define EF_WINDOW_MS       {int(window_ms)}\n"
+        f"#define EF_WINDOW_SAMPLES  {n_samples}\n"
+        f"#define EF_N_CLASSES       {n_classes}\n"
+        f"#define EF_N_FEATURES      {n_feat}\n\n"
+        f"/* ── Class labels ────────────────────────────────────────────────── */\n"
+        f"static const char *EF_CLASSES[{n_classes}] = {{ {class_list} }};\n\n"
+        f"/* ── Butterworth IIR coefficients (b, a) — order 4 ──────────────── */\n"
+        f"{_c_float_arr('EF_FILTER_B', b, 5)}\n"
+        f"{_c_float_arr('EF_FILTER_A', a, 5)}\n\n"
+        f"/* ── Scaler ──────────────────────────────────────────────────────── */\n"
+        f"{_c_scale_fn(scaler, n_feat)}\n\n"
+        f"/* ── Model weights ───────────────────────────────────────────────── */\n"
+        f"{model_sec}\n\n"
+        f"/* ── Math helpers ────────────────────────────────────────────────── */\n"
+        f"{_c_math_helpers()}\n\n"
+        f"/* ── IIR filter ──────────────────────────────────────────────────── */\n"
+        f"{_c_filter_fn()}\n\n"
+        f"/* ── Feature extraction ──────────────────────────────────────────── */\n"
+        f"{_c_feature_fn(sel)}\n\n"
+        f"/* ── Public API ──────────────────────────────────────────────────── */\n"
+        f"/**\n"
+        f" * ef_classify — filter -> extract -> scale -> predict\n"
+        f" * @param ax   Accelerometer X samples (EF_WINDOW_SAMPLES floats)\n"
+        f" * @param ay   Accelerometer Y samples (NULL to reuse ax)\n"
+        f" * @param az   Accelerometer Z samples (NULL to reuse ax)\n"
+        f" * @param n    Sample count — must equal EF_WINDOW_SAMPLES\n"
+        f" * @return     Class index [0..EF_N_CLASSES-1]; index into EF_CLASSES[]\n"
+        f" */\n"
+        f"static int8_t ef_classify(\n"
+        f"    const float *ax, const float *ay, const float *az, uint16_t n) {{\n"
+        f"    float fax[EF_WINDOW_SAMPLES], fay[EF_WINDOW_SAMPLES], faz[EF_WINDOW_SAMPLES];\n"
+        f"    float feat[EF_N_FEATURES];\n"
+        f"    ef_filter_reset();\n"
+        f"    ef_filter_axis(ax,           fax, (int)n, ef_flt_state[0]);\n"
+        f"    ef_filter_axis(ay ? ay : ax, fay, (int)n, ef_flt_state[1]);\n"
+        f"    ef_filter_axis(az ? az : ax, faz, (int)n, ef_flt_state[2]);\n"
+        f"    ef_extract_features(fax, fay, faz, (int)n, feat);\n"
+        f"    ef_scale(feat);\n"
+        f"    return {predict_call};\n"
+        f"}}\n"
+    )
+    return header
+
+
+@app.get("/export/c/{project_id}")
+def export_c_header(project_id: str, chip: str = "generic"):
+    if _saved_pipeline is None:
+        raise HTTPException(status_code=400, detail="No trained model. Run /train first.")
+    try:
+        header = _generate_c_header(project_id, chip)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"C export failed: {exc}")
+    return Response(
+        content    = header.encode(),
+        media_type = "text/plain",
+        headers    = {"Content-Disposition": f'attachment; filename="{project_id}_classifier.h"'},
+    )
+
+
 # ── /copilot/chat ─────────────────────────────────────────────────────────────
 
 COPILOT_SYSTEM = (
