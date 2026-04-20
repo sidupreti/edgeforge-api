@@ -603,6 +603,7 @@ class TrainRequest(BaseModel):
     selected_features: List[str]   = []
     model_type:        str         = "auto"           # auto | rf | svm | nn
     custom_blocks:     Optional[List[dict]] = []      # list of {id, name, code} for custom/standard blocks
+    events:            Optional[List[EventData]] = None  # fallback if backend lost in-memory state
 
 
 # ── Custom block execution ────────────────────────────────────────────────────
@@ -967,14 +968,36 @@ def _run_training(req: TrainRequest, events: List[EventData]):
         _set_status(state="error", error=str(exc))
 
 
+@app.get("/session/{project_id}")
+def get_session(project_id: str):
+    """Debug endpoint — returns cached event count and class distribution."""
+    evts = project_events.get(project_id, [])
+    class_counts: Dict[str, int] = {}
+    for ev in evts:
+        class_counts[ev.class_label] = class_counts.get(ev.class_label, 0) + 1
+    return {
+        "project_id":   project_id,
+        "event_count":  len(evts),
+        "classes":      list(class_counts.keys()),
+        "class_counts": class_counts,
+        "has_analysis": project_id in {k for k, v in projects.items()},
+    }
+
+
 @app.post("/train")
 def start_training(req: TrainRequest):
-    if req.project_id not in project_events:
+    # Use stored events; fall back to events sent in request body
+    events = project_events.get(req.project_id)
+    if not events and req.events:
+        events = req.events
+        project_events[req.project_id] = events  # cache for subsequent calls
+
+    if not events:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"No events cached for project '{req.project_id}'. "
-                "Run /analyze-signal with project_id first."
+                f"No events found for project '{req.project_id}'. "
+                "Please upload or collect data first."
             ),
         )
 
@@ -983,7 +1006,6 @@ def start_training(req: TrainRequest):
             raise HTTPException(status_code=409, detail="Training already in progress.")
         _training_status["state"] = "running"
 
-    events = project_events[req.project_id]
     t = threading.Thread(target=_run_training, args=(req, events), daemon=True)
     t.start()
     return {"status": "started", "project_id": req.project_id, "event_count": len(events)}
