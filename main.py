@@ -405,6 +405,17 @@ def _parse_csv_flexible(content: bytes) -> tuple:
     return df, notes, detected_label
 
 
+def _label_from_filename(filename: str) -> str | None:
+    """
+    Extract a class label from a filename stem.
+    'metal_event_003.csv' → 'metal',  'wood tap (2).txt' → 'wood'
+    Takes the first non-numeric, non-empty token after splitting on separators.
+    """
+    base   = filename.split("/")[-1].rsplit(".", 1)[0]   # strip path + extension
+    tokens = [t for t in re.split(r"[_\-\s()]+", base.lower()) if t and not t.isdigit()]
+    return tokens[0] if tokens else None
+
+
 def _zip_extract_csvs(content: bytes) -> list:
     """Extract (internal_path, bytes) for every CSV/TXT inside a ZIP."""
     import zipfile, io as _io
@@ -490,19 +501,24 @@ async def upload_events(
                 continue
 
             for csv_path, csv_bytes in csv_files:
-                # Use zip_sel_map label if provided, else fall back to provided label
+                # Priority: explicit zip_sel_map > provided label > auto-detect
                 csv_label = zip_sel_map.get(csv_path, label)
                 short     = csv_path.split("/")[-1]
                 try:
                     df, notes, detected = _parse_csv_flexible(csv_bytes)
                     n      = len(df)
                     dur_ms = float(df["timestamp"].sum()) / 1000.0
+                    if csv_label == "auto":
+                        # data detection (WISDM activity) → filename → fallback
+                        final_label = detected or _label_from_filename(short) or "unknown"
+                    else:
+                        final_label = csv_label
                     ev = EventData(
                         ax          = df["a_x"].tolist(),
                         ay          = df["a_y"].tolist(),
                         az          = df["a_z"].tolist(),
                         duration_ms = round(dur_ms, 1),
-                        class_label = detected if (csv_label == "auto" and detected) else csv_label,
+                        class_label = final_label,
                     )
                     parsed_events.append(ev)
                     event_meta.append({
