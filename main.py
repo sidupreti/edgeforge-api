@@ -12,7 +12,7 @@ import random
 import re
 import threading
 import time
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -240,6 +240,130 @@ def analyze_signal(req: AnalyzeSignalRequest):
                 f"Recommended normalization window: {recommended_window} ms."
             ),
         },
+    }
+
+
+# ── /upload-events ───────────────────────────────────────────────────────────
+
+_UPLOAD_COL_MAP = {
+    "t": "timestamp", "time": "timestamp", "ts": "timestamp", "time_us": "timestamp",
+    "x": "a_x", "ax": "a_x", "accel_x": "a_x", "acc_x": "a_x",
+    "y": "a_y", "ay": "a_y", "accel_y": "a_y", "acc_y": "a_y",
+    "z": "a_z", "az": "a_z", "accel_z": "a_z", "acc_z": "a_z",
+}
+
+
+def _parse_csv_bytes(content: bytes) -> pd.DataFrame:
+    """Parse uploaded CSV/TXT bytes into a normalised DataFrame with a_x, a_y, a_z columns."""
+    import io
+    text = content.decode("utf-8", errors="replace")
+    sep  = "\t" if "\t" in text.split("\n")[0] else ","
+    df   = pd.read_csv(io.StringIO(text), sep=sep, comment="#")
+
+    # Normalise column names: strip, lower, map aliases
+    df.columns = [
+        _UPLOAD_COL_MAP.get(c.strip().lower(), c.strip().lower())
+        for c in df.columns
+    ]
+
+    # Require at least a_x
+    if "a_x" not in df.columns:
+        raise ValueError(f"No recognised X-axis column. Got: {list(df.columns)}")
+
+    # Fill missing axes with zeros
+    for col in ("a_y", "a_z"):
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # Ensure timestamp column — default to SAMPLE_RATE_HZ-based diff
+    if "timestamp" not in df.columns:
+        df["timestamp"] = DT_US  # 10 000 µs per sample
+
+    # Drop rows with any NaN in the axis columns
+    df = df[["timestamp", "a_x", "a_y", "a_z"]].dropna()
+    df = df.astype(float)
+
+    # If timestamps look like absolute epoch ms/us, convert to diffs
+    ts = df["timestamp"].values
+    if len(ts) > 1 and ts[0] > 1e9:
+        diffs          = np.diff(ts, prepend=ts[0])
+        df["timestamp"] = np.abs(diffs)
+
+    return df
+
+
+@app.post("/upload-events")
+async def upload_events(
+    files:      List[UploadFile] = File(...),
+    project_id: str              = Form(...),
+    labels:     List[str]        = Form(...),
+):
+    if len(files) != len(labels):
+        raise HTTPException(
+            status_code=400,
+            detail=f"files ({len(files)}) and labels ({len(labels)}) count mismatch",
+        )
+
+    parsed_events: List[EventData] = []
+    event_meta:    list            = []
+    errors:        list            = []
+
+    for uf, label in zip(files, labels):
+        raw = await uf.read()
+        try:
+            df      = _parse_csv_bytes(raw)
+            n       = len(df)
+            if n < 2:
+                raise ValueError("File has fewer than 2 data rows")
+            dur_ms  = float(df["timestamp"].sum()) / 1000.0
+
+            ev = EventData(
+                ax          = df["a_x"].tolist(),
+                ay          = df["a_y"].tolist(),
+                az          = df["a_z"].tolist(),
+                duration_ms = round(dur_ms, 1),
+                class_label = label,
+            )
+            parsed_events.append(ev)
+            event_meta.append({
+                "id":          f"upload-{len(parsed_events)}-{int(time.time()*1000)}",
+                "class_label": label,
+                "duration_ms": round(dur_ms, 1),
+                "row_count":   n,
+                "waveform_az": df["a_z"].tolist(),
+                "filename":    uf.filename,
+            })
+        except Exception as exc:
+            errors.append({"filename": uf.filename, "error": str(exc)})
+
+    if not parsed_events:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "No files could be parsed. Check that your CSV has timestamp,a_x,a_y,a_z columns.",
+                "errors":  errors,
+            },
+        )
+
+    # Cache events for training (append to any existing events)
+    existing = project_events.get(project_id, [])
+    project_events[project_id] = list(existing) + parsed_events
+
+    # Run the same analysis as /analyze-signal
+    fake_req = AnalyzeSignalRequest(
+        events         = parsed_events,
+        sample_rate_hz = SAMPLE_RATE_HZ,
+        project_id     = None,   # already stored above
+    )
+    try:
+        analysis = analyze_signal(fake_req)
+    except Exception:
+        analysis = None
+
+    return {
+        "events":   event_meta,
+        "analysis": analysis,
+        "errors":   errors,
     }
 
 
