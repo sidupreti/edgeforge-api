@@ -246,57 +246,212 @@ def analyze_signal(req: AnalyzeSignalRequest):
 # ── /upload-events ───────────────────────────────────────────────────────────
 
 _UPLOAD_COL_MAP = {
-    "t": "timestamp", "time": "timestamp", "ts": "timestamp", "time_us": "timestamp",
+    # timestamp aliases
+    "t": "timestamp", "time": "timestamp", "ts": "timestamp",
+    "time_us": "timestamp", "time_ms": "timestamp", "time_s": "timestamp",
+    "sample_time": "timestamp", "elapsed": "timestamp",
+    # x-axis aliases
     "x": "a_x", "ax": "a_x", "accel_x": "a_x", "acc_x": "a_x",
+    "x-axis": "a_x", "xaxis": "a_x", "sensor3": "a_x",
+    # y-axis aliases
     "y": "a_y", "ay": "a_y", "accel_y": "a_y", "acc_y": "a_y",
+    "y-axis": "a_y", "yaxis": "a_y", "sensor4": "a_y",
+    # z-axis aliases
     "z": "a_z", "az": "a_z", "accel_z": "a_z", "acc_z": "a_z",
+    "z-axis": "a_z", "zaxis": "a_z", "sensor5": "a_z",
+}
+
+# WISDM-style activity labels that map to human-readable strings
+_WISDM_ACTIVITY_MAP = {
+    "A": "Walking", "B": "Jogging", "C": "Stairs",
+    "D": "Sitting", "E": "Standing", "F": "LyingDown",
 }
 
 
-def _parse_csv_bytes(content: bytes) -> pd.DataFrame:
-    """Parse uploaded CSV/TXT bytes into a normalised DataFrame with a_x, a_y, a_z columns."""
+def _parse_csv_flexible(content: bytes) -> tuple:
+    """
+    Parse uploaded CSV/TXT bytes into (df, notes, detected_label).
+
+    Returns
+    -------
+    df : pd.DataFrame with columns [timestamp, a_x, a_y, a_z]
+    notes : list[str]  human-readable detection messages
+    detected_label : str | None  class label found in data (e.g. WISDM activity)
+    """
     import io
-    text = content.decode("utf-8", errors="replace")
-    sep  = "\t" if "\t" in text.split("\n")[0] else ","
-    df   = pd.read_csv(io.StringIO(text), sep=sep, comment="#")
 
-    # Normalise column names: strip, lower, map aliases
-    df.columns = [
-        _UPLOAD_COL_MAP.get(c.strip().lower(), c.strip().lower())
-        for c in df.columns
-    ]
+    notes: list          = []
+    detected_label: str | None = None
 
-    # Require at least a_x
-    if "a_x" not in df.columns:
-        raise ValueError(f"No recognised X-axis column. Got: {list(df.columns)}")
+    text = content.decode("utf-8", errors="replace").strip()
+    lines = [l for l in text.split("\n") if l.strip() and not l.strip().startswith("#")]
+    if len(lines) < 2:
+        raise ValueError("File has fewer than 2 data rows")
 
-    # Fill missing axes with zeros
+    # ── Detect separator ───────────────────────────────────────────────────────
+    first = lines[0]
+    if "\t" in first:
+        sep = "\t"
+    elif ";" in first:
+        sep = ";"
+    elif "  " in first or (first.replace(" ", "").replace(".", "").replace("-", "").isnumeric()):
+        sep = r"\s+"   # space-separated (UCI HAR style)
+    else:
+        sep = ","
+
+    # ── Detect headerless numeric file ─────────────────────────────────────────
+    first_vals = re.split(r"[\s,;\t]+", first.strip())
+    first_is_numeric = all(
+        re.match(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$", v) for v in first_vals if v
+    )
+
+    # ── Detect WISDM format: user, activity, timestamp, x, y, z (no header) ───
+    is_wisdm = (
+        not first_is_numeric
+        and len(first_vals) >= 6
+        and re.match(r"^\d+$", first_vals[0] or "")  # user ID (integer)
+        and re.match(r"^[A-Za-z]", first_vals[1] or "")  # activity string
+        and re.match(r"^\d{7,}$", first_vals[2] or "")  # large timestamp
+    )
+
+    if is_wisdm:
+        extra = len(first_vals) - 6
+        hdr = ["user", "activity", "timestamp", "a_x", "a_y", "a_z"] + [f"col{i}" for i in range(extra)]
+        df = pd.read_csv(io.StringIO(text), sep=sep, header=None, names=hdr, engine="python")
+        notes.append("WISDM dataset format detected (user, activity, timestamp, x, y, z)")
+    elif first_is_numeric:
+        # UCI HAR: space-separated, 561 features, no header
+        if sep == r"\s+" and len(first_vals) > 20:
+            raise ValueError(
+                "This appears to be a pre-processed feature file (561 columns). "
+                "EdgeForge needs raw accelerometer time series data, not pre-extracted features."
+            )
+        # Headerless CSV: assume timestamp,a_x,a_y,a_z or just a_x,a_y,a_z
+        n_cols = len(first_vals)
+        if n_cols >= 4:
+            hdr = ["timestamp", "a_x", "a_y", "a_z"] + [f"col{i}" for i in range(n_cols - 4)]
+        elif n_cols == 3:
+            hdr = ["a_x", "a_y", "a_z"]
+        elif n_cols == 1:
+            hdr = ["a_x"]
+        else:
+            hdr = ["a_x", "a_y"]
+        notes.append(f"No header row detected — assumed columns: {', '.join(hdr[:4])}")
+        df = pd.read_csv(io.StringIO(text), sep=sep, header=None, names=hdr, engine="python")
+    else:
+        df = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
+
+    # ── Normalise column names ─────────────────────────────────────────────────
+    orig_cols = list(df.columns)
+    df.columns = [_UPLOAD_COL_MAP.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns]
+    norm_cols  = list(df.columns)
+
+    detected_cols = [o for o, n in zip(orig_cols, norm_cols) if o != n]
+    if detected_cols:
+        notes.append(f"Columns detected: {', '.join(str(c) for c in orig_cols)} — mapped to EdgeForge format")
+
+    # ── WISDM format: user, activity, timestamp, x, y, z ──────────────────────
+    if "activity" in norm_cols:
+        # Extract the most common activity label as the class
+        act_col = df.columns[norm_cols.index("activity")] if "activity" in norm_cols else "activity"
+        activities = df["activity"].dropna().astype(str).str.strip(";").str.strip()
+        most_common = activities.mode()
+        if len(most_common) > 0:
+            raw_act = str(most_common.iloc[0])
+            detected_label = _WISDM_ACTIVITY_MAP.get(raw_act, raw_act)
+            unique_acts    = activities.unique().tolist()
+            notes.append(
+                f"WISDM format detected — activity column found: {unique_acts[:5]}"
+                + (f" ... (+{len(unique_acts)-5} more)" if len(unique_acts) > 5 else "")
+                + f". Using '{detected_label}' as class label."
+            )
+
+    # ── Require at least a_x ──────────────────────────────────────────────────
+    if "a_x" not in norm_cols:
+        raise ValueError(
+            f"No recognised X-axis column. Got columns: {orig_cols}. "
+            "Expected one of: a_x, x, ax, accel_x, acc_x"
+        )
+
+    # ── Fill missing axes ──────────────────────────────────────────────────────
     for col in ("a_y", "a_z"):
-        if col not in df.columns:
+        if col not in norm_cols:
             df[col] = 0.0
 
-    # Ensure timestamp column — default to SAMPLE_RATE_HZ-based diff
-    if "timestamp" not in df.columns:
-        df["timestamp"] = DT_US  # 10 000 µs per sample
+    # ── Ensure timestamp column ────────────────────────────────────────────────
+    if "timestamp" not in norm_cols:
+        df["timestamp"] = DT_US
+        notes.append(f"No timestamp column found — assuming {int(SAMPLE_RATE_HZ)} Hz sample rate")
 
-    # Drop rows with any NaN in the axis columns
-    df = df[["timestamp", "a_x", "a_y", "a_z"]].dropna()
-    df = df.astype(float)
+    # ── Keep only needed columns ───────────────────────────────────────────────
+    df = df[["timestamp", "a_x", "a_y", "a_z"]].copy()
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.dropna(inplace=True)
 
-    # If timestamps look like absolute epoch ms/us, convert to diffs
+    if len(df) < 2:
+        raise ValueError("File has fewer than 2 valid numeric data rows after parsing")
+
+    # ── Convert absolute epoch timestamps to per-sample diffs ─────────────────
     ts = df["timestamp"].values
     if len(ts) > 1 and ts[0] > 1e9:
-        diffs          = np.diff(ts, prepend=ts[0])
+        diffs = np.diff(ts, prepend=ts[1])
         df["timestamp"] = np.abs(diffs)
+        notes.append("Absolute timestamps converted to per-sample intervals")
 
-    return df
+    # Clamp unreasonable timestamps (< 100µs or > 1s) to DT_US
+    df["timestamp"] = df["timestamp"].clip(lower=100, upper=1_000_000).fillna(DT_US)
+
+    return df, notes, detected_label
+
+
+def _zip_extract_csvs(content: bytes) -> list:
+    """Extract (internal_path, bytes) for every CSV/TXT inside a ZIP."""
+    import zipfile, io as _io
+    results = []
+    with zipfile.ZipFile(_io.BytesIO(content)) as zf:
+        for name in sorted(zf.namelist()):
+            # Skip macOS metadata dirs and non-CSV files
+            if name.startswith("__MACOSX") or name.endswith("/"):
+                continue
+            if not name.lower().endswith((".csv", ".txt")):
+                continue
+            try:
+                data = zf.read(name)
+                results.append((name, data))
+            except Exception:
+                pass
+    return results
+
+
+@app.post("/inspect-zip")
+async def inspect_zip(file: UploadFile = File(...)):
+    """Return the list of CSV/TXT paths found inside a ZIP without processing them."""
+    import zipfile, io as _io
+    content = await file.read()
+    try:
+        entries = []
+        with zipfile.ZipFile(_io.BytesIO(content)) as zf:
+            for name in sorted(zf.namelist()):
+                if name.startswith("__MACOSX") or name.endswith("/"):
+                    continue
+                if not name.lower().endswith((".csv", ".txt")):
+                    continue
+                info = zf.getinfo(name)
+                entries.append({"path": name, "size_bytes": info.file_size})
+        if not entries:
+            raise HTTPException(status_code=400, detail="No CSV or TXT files found inside the ZIP")
+        return {"files": entries}
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid ZIP file")
 
 
 @app.post("/upload-events")
 async def upload_events(
-    files:      List[UploadFile] = File(...),
-    project_id: str              = Form(...),
-    labels:     List[str]        = Form(...),
+    files:          List[UploadFile]   = File(...),
+    project_id:     str                = Form(...),
+    labels:         List[str]          = Form(...),
+    zip_selections: Optional[str]      = Form(None),  # JSON: [{path, label}]
 ):
     if len(files) != len(labels):
         raise HTTPException(
@@ -308,39 +463,93 @@ async def upload_events(
     event_meta:    list            = []
     errors:        list            = []
 
-    for uf, label in zip(files, labels):
-        raw = await uf.read()
+    # Parse optional per-path selections for ZIP files
+    zip_sel_map: dict = {}  # {zip_path -> label}
+    if zip_selections:
         try:
-            df      = _parse_csv_bytes(raw)
-            n       = len(df)
-            if n < 2:
-                raise ValueError("File has fewer than 2 data rows")
-            dur_ms  = float(df["timestamp"].sum()) / 1000.0
+            for item in json_lib.loads(zip_selections):
+                zip_sel_map[item["path"]] = item["label"]
+        except Exception:
+            pass
 
-            ev = EventData(
-                ax          = df["a_x"].tolist(),
-                ay          = df["a_y"].tolist(),
-                az          = df["a_z"].tolist(),
-                duration_ms = round(dur_ms, 1),
-                class_label = label,
-            )
-            parsed_events.append(ev)
-            event_meta.append({
-                "id":          f"upload-{len(parsed_events)}-{int(time.time()*1000)}",
-                "class_label": label,
-                "duration_ms": round(dur_ms, 1),
-                "row_count":   n,
-                "waveform_az": df["a_z"].tolist(),
-                "filename":    uf.filename,
-            })
-        except Exception as exc:
-            errors.append({"filename": uf.filename, "error": str(exc)})
+    for uf, label in zip(files, labels):
+        raw      = await uf.read()
+        fname    = uf.filename or "upload"
+        is_zip   = fname.lower().endswith(".zip")
+
+        # ── ZIP file: extract and process each CSV ─────────────────────────
+        if is_zip:
+            try:
+                csv_files = _zip_extract_csvs(raw)
+            except Exception as exc:
+                errors.append({"filename": fname, "error": f"ZIP extraction failed: {exc}"})
+                continue
+
+            if not csv_files:
+                errors.append({"filename": fname, "error": "No CSV/TXT files found inside ZIP"})
+                continue
+
+            for csv_path, csv_bytes in csv_files:
+                # Use zip_sel_map label if provided, else fall back to provided label
+                csv_label = zip_sel_map.get(csv_path, label)
+                short     = csv_path.split("/")[-1]
+                try:
+                    df, notes, detected = _parse_csv_flexible(csv_bytes)
+                    n      = len(df)
+                    dur_ms = float(df["timestamp"].sum()) / 1000.0
+                    ev = EventData(
+                        ax          = df["a_x"].tolist(),
+                        ay          = df["a_y"].tolist(),
+                        az          = df["a_z"].tolist(),
+                        duration_ms = round(dur_ms, 1),
+                        class_label = detected if (csv_label == "auto" and detected) else csv_label,
+                    )
+                    parsed_events.append(ev)
+                    event_meta.append({
+                        "id":          f"upload-{len(parsed_events)}-{int(time.time()*1000)}",
+                        "class_label": ev.class_label,
+                        "duration_ms": round(dur_ms, 1),
+                        "row_count":   n,
+                        "waveform_az": df["a_z"].tolist(),
+                        "filename":    short,
+                        "zip_path":    csv_path,
+                        "source_zip":  fname,
+                        "notes":       notes,
+                    })
+                except Exception as exc:
+                    errors.append({"filename": f"{fname}/{short}", "error": str(exc)})
+        else:
+            # ── Regular CSV/TXT file ───────────────────────────────────────
+            try:
+                df, notes, detected = _parse_csv_flexible(raw)
+                n      = len(df)
+                dur_ms = float(df["timestamp"].sum()) / 1000.0
+                final_label = detected if (label == "auto" and detected) else label
+                ev = EventData(
+                    ax          = df["a_x"].tolist(),
+                    ay          = df["a_y"].tolist(),
+                    az          = df["a_z"].tolist(),
+                    duration_ms = round(dur_ms, 1),
+                    class_label = final_label,
+                )
+                parsed_events.append(ev)
+                event_meta.append({
+                    "id":          f"upload-{len(parsed_events)}-{int(time.time()*1000)}",
+                    "class_label": final_label,
+                    "duration_ms": round(dur_ms, 1),
+                    "row_count":   n,
+                    "waveform_az": df["a_z"].tolist(),
+                    "filename":    fname,
+                    "notes":       notes,
+                })
+            except Exception as exc:
+                errors.append({"filename": fname, "error": str(exc)})
 
     if not parsed_events:
         raise HTTPException(
             status_code=422,
             detail={
-                "message": "No files could be parsed. Check that your CSV has timestamp,a_x,a_y,a_z columns.",
+                "message": "No files could be parsed.",
                 "errors":  errors,
             },
         )
@@ -353,7 +562,7 @@ async def upload_events(
     fake_req = AnalyzeSignalRequest(
         events         = parsed_events,
         sample_rate_hz = SAMPLE_RATE_HZ,
-        project_id     = None,   # already stored above
+        project_id     = None,
     )
     try:
         analysis = analyze_signal(fake_req)
