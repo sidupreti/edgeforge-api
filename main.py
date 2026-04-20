@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -123,6 +123,28 @@ class EventData(BaseModel):
     az: List[float] = []
     duration_ms: float
     class_label: str = ""
+
+
+class AltEventData(BaseModel):
+    """Alternative curl-friendly format: {label, data: [[ts, x, y, z], ...]}"""
+    label: str
+    data:  List[List[float]]  # each row: [timestamp_us, a_x, a_y, a_z]
+
+
+def _normalize_event(ev) -> "EventData":
+    """Convert AltEventData → EventData if needed; pass EventData through."""
+    if isinstance(ev, AltEventData):
+        rows = ev.data
+        ax = [r[1] for r in rows if len(r) > 1]
+        ay = [r[2] for r in rows if len(r) > 2]
+        az = [r[3] for r in rows if len(r) > 3]
+        if rows and len(rows[0]) >= 1:
+            ts_vals = [r[0] for r in rows]
+            duration_ms = (max(ts_vals) - min(ts_vals)) / 1000.0 if len(ts_vals) > 1 else len(rows) * 10.0
+        else:
+            duration_ms = len(rows) * 10.0
+        return EventData(ax=ax, ay=ay, az=az, duration_ms=duration_ms, class_label=ev.label)
+    return ev
 
 
 class AnalyzeSignalRequest(BaseModel):
@@ -603,7 +625,7 @@ class TrainRequest(BaseModel):
     selected_features: List[str]   = []
     model_type:        str         = "auto"           # auto | rf | svm | nn
     custom_blocks:     Optional[List[dict]] = []      # list of {id, name, code} for custom/standard blocks
-    events:            Optional[List[EventData]] = None  # fallback if backend lost in-memory state
+    events:            Optional[List[Union[EventData, AltEventData]]] = None  # fallback; accepts both formats
 
 
 # ── Custom block execution ────────────────────────────────────────────────────
@@ -989,7 +1011,7 @@ def start_training(req: TrainRequest):
     # Use stored events; fall back to events sent in request body
     events = project_events.get(req.project_id)
     if not events and req.events:
-        events = req.events
+        events = [_normalize_event(ev) for ev in req.events]
         project_events[req.project_id] = events  # cache for subsequent calls
 
     if not events:
