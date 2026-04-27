@@ -148,7 +148,7 @@ def _normalize_event(ev) -> "EventData":
 
 
 class AnalyzeSignalRequest(BaseModel):
-    events:         List[EventData]
+    events:         List[Union[EventData, AltEventData]]
     sample_rate_hz: float = 100.0
     project_id:     Optional[str] = None   # if set, events are cached for /train
 
@@ -183,18 +183,32 @@ def analyze_signal(req: AnalyzeSignalRequest):
     if not req.events:
         raise HTTPException(status_code=400, detail="events list is empty")
 
-    # Cache events for later training
+    # Normalize AltEventData → EventData (handles {label, data:[[ts,x,y,z],...]} format)
+    events: List[EventData] = []
+    for raw in req.events:
+        ev = _normalize_event(raw)
+        # If ax is empty but az has data, copy az→ax so analysis can proceed
+        if not ev.ax and ev.az:
+            ev = EventData(ax=ev.az, ay=ev.ay, az=ev.az,
+                           duration_ms=ev.duration_ms, class_label=ev.class_label)
+        events.append(ev)
+
+    # Cache normalized events for later training
     if req.project_id:
-        project_events[req.project_id] = req.events
+        project_events[req.project_id] = events
 
     sr    = req.sample_rate_hz
     dt_us = int(1_000_000 / sr)
 
-    first = req.events[0]
-    if not first.ax:
-        raise HTTPException(status_code=400, detail="first event has no ax samples")
+    first = events[0]
+    primary = first.ax or first.ay or first.az
+    if not primary:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not parse event data — expected columns timestamp, a_x, a_y, a_z"
+        )
 
-    sr_df       = _build_sample_df(first.ax, dt_us)
+    sr_df       = _build_sample_df(primary, dt_us)
     measured_hz = analyze_sample_rate(sr_df)
     sr_delta    = abs(measured_hz - sr)
     sr_note     = (
@@ -203,7 +217,7 @@ def analyze_signal(req: AnalyzeSignalRequest):
     )
 
     axis_event_cutoffs: Dict[str, List[float]] = {"ax": [], "ay": [], "az": []}
-    for ev in req.events:
+    for ev in events:
         for axis, samples in [("ax", ev.ax), ("ay", ev.ay), ("az", ev.az)]:
             if samples:
                 axis_event_cutoffs[axis].append(
@@ -222,7 +236,7 @@ def analyze_signal(req: AnalyzeSignalRequest):
     else:
         recommended_cutoff = round(nyquist * 0.40, 1)
 
-    durations          = np.array([ev.duration_ms for ev in req.events], dtype=float)
+    durations          = np.array([ev.duration_ms for ev in events], dtype=float)
     dur_min            = float(durations.min())
     dur_max            = float(durations.max())
     dur_mean           = float(durations.mean())
@@ -230,12 +244,12 @@ def analyze_signal(req: AnalyzeSignalRequest):
     recommended_window = int(np.ceil(dur_p90 / 50) * 50)
 
     return {
-        "event_count": len(req.events),
+        "event_count": len(events),
         "sample_rate": {
             "measured_hz": round(measured_hz, 1),
             "declared_hz": sr,
             "explanation": (
-                f"Reconstructed from {len(first.ax)}-sample event at "
+                f"Reconstructed from {len(primary)}-sample event at "
                 f"declared {sr} Hz ({dt_us} µs/sample). "
                 f"Measured {round(measured_hz, 1)} Hz — {sr_note}"
             ),
@@ -245,7 +259,7 @@ def analyze_signal(req: AnalyzeSignalRequest):
             "energy_threshold_pct": 90,
             "axis_cutoffs_hz":      axis_cutoffs_avg,
             "explanation": (
-                f"90% of signal energy across {len(req.events)} event(s) lies below: "
+                f"90% of signal energy across {len(events)} event(s) lies below: "
                 + ", ".join(f"{ax}={hz} Hz" for ax, hz in axis_cutoffs_avg.items())
                 + f". Recommended cutoff: {recommended_cutoff} Hz. Nyquist: {nyquist} Hz."
             ),
@@ -258,7 +272,7 @@ def analyze_signal(req: AnalyzeSignalRequest):
             "p90_ms":         round(dur_p90, 1),
             "explanation": (
                 f"Event durations — min: {dur_min:.0f} ms, mean: {dur_mean:.0f} ms, "
-                f"max: {dur_max:.0f} ms, p90: {dur_p90:.0f} ms ({len(req.events)} event(s)). "
+                f"max: {dur_max:.0f} ms, p90: {dur_p90:.0f} ms ({len(events)} event(s)). "
                 f"Recommended normalization window: {recommended_window} ms."
             ),
         },
@@ -589,6 +603,8 @@ async def upload_events(
                         "class_label": ev.class_label,
                         "duration_ms": round(dur_ms, 1),
                         "row_count":   n,
+                        "waveform_ax": df["a_x"].tolist(),
+                        "waveform_ay": df["a_y"].tolist(),
                         "waveform_az": df["a_z"].tolist(),
                         "filename":    short,
                         "zip_path":    csv_path,
@@ -621,6 +637,8 @@ async def upload_events(
                     "class_label": final_label,
                     "duration_ms": round(dur_ms, 1),
                     "row_count":   n,
+                    "waveform_ax": df["a_x"].tolist(),
+                    "waveform_ay": df["a_y"].tolist(),
                     "waveform_az": df["a_z"].tolist(),
                     "filename":    fname,
                     "notes":       notes,
@@ -1063,11 +1081,12 @@ def get_session(project_id: str):
 
 @app.post("/train")
 def start_training(req: TrainRequest):
-    # Use stored events; fall back to events sent in request body
-    events = project_events.get(req.project_id)
-    if not events and req.events:
+    # Events in request body take priority (most up-to-date); fall back to session cache
+    if req.events:
         events = [_normalize_event(ev) for ev in req.events]
-        project_events[req.project_id] = events  # cache for subsequent calls
+        project_events[req.project_id] = events  # update cache
+    else:
+        events = project_events.get(req.project_id)
 
     if not events:
         raise HTTPException(
