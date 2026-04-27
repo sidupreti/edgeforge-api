@@ -294,6 +294,11 @@ def _parse_csv_flexible(content: bytes) -> tuple:
     """
     Parse uploaded CSV/TXT bytes into (df, notes, detected_label).
 
+    Primary format (tried first): 4-column, no header row:
+        timestamp_us, ax, ay, az
+
+    Falls back to WISDM and generic header-based detection.
+
     Returns
     -------
     df : pd.DataFrame with columns [timestamp, a_x, a_y, a_z]
@@ -302,10 +307,11 @@ def _parse_csv_flexible(content: bytes) -> tuple:
     """
     import io
 
-    notes: list          = []
+    notes: list = []
     detected_label: str | None = None
 
     text = content.decode("utf-8", errors="replace").strip()
+    # Skip blank lines and comment lines
     lines = [l for l in text.split("\n") if l.strip() and not l.strip().startswith("#")]
     if len(lines) < 2:
         raise ValueError("File has fewer than 2 data rows")
@@ -317,39 +323,73 @@ def _parse_csv_flexible(content: bytes) -> tuple:
     elif ";" in first:
         sep = ";"
     elif "  " in first or (first.replace(" ", "").replace(".", "").replace("-", "").isnumeric()):
-        sep = r"\s+"   # space-separated (UCI HAR style)
+        sep = r"\s+"
     else:
         sep = ","
 
-    # ── Detect headerless numeric file ─────────────────────────────────────────
     first_vals = re.split(r"[\s,;\t]+", first.strip())
     first_is_numeric = all(
         re.match(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$", v) for v in first_vals if v
     )
+    n_cols = len([v for v in first_vals if v])
 
-    # ── Detect WISDM format: user, activity, timestamp, x, y, z (no header) ───
+    # ══ PRIMARY FORMAT: exactly 4 numeric columns, no header ══════════════════
+    # Columns are always: timestamp_us, a_x, a_y, a_z — assign directly.
+    # Never try to infer column names by string matching for this path.
+    if first_is_numeric and n_cols == 4:
+        df = pd.read_csv(
+            io.StringIO(text), sep=sep, header=None,
+            names=["timestamp", "a_x", "a_y", "a_z"], engine="python",
+        )
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.dropna(inplace=True)
+
+        if len(df) < 5:
+            raise ValueError(
+                f"File has only {len(df)} valid rows — need at least 5 data rows"
+            )
+
+        # Validate timestamps are positive
+        if (df["timestamp"] <= 0).any():
+            raise ValueError(
+                "timestamp column contains non-positive values — "
+                "expected microseconds between samples (typically 8000–12000 for 100 Hz)"
+            )
+
+        # Convert absolute epoch timestamps → per-sample intervals
+        ts = df["timestamp"].values
+        if len(ts) > 1 and ts[0] > 1e9:
+            diffs = np.diff(ts, prepend=ts[1])
+            df["timestamp"] = np.abs(diffs)
+            notes.append("Absolute timestamps converted to per-sample intervals")
+
+        df["timestamp"] = df["timestamp"].clip(lower=100, upper=1_000_000).fillna(DT_US)
+        notes.append("Standard 4-column format: timestamp_us, a_x, a_y, a_z")
+        return df, notes, None
+
+    # ══ WISDM format: user, activity, timestamp, x, y, z (no header) ══════════
     is_wisdm = (
         not first_is_numeric
-        and len(first_vals) >= 6
-        and re.match(r"^\d+$", first_vals[0] or "")  # user ID (integer)
-        and re.match(r"^[A-Za-z]", first_vals[1] or "")  # activity string
-        and re.match(r"^\d{7,}$", first_vals[2] or "")  # large timestamp
+        and n_cols >= 6
+        and re.match(r"^\d+$", first_vals[0] or "")
+        and re.match(r"^[A-Za-z]", first_vals[1] or "")
+        and re.match(r"^\d{7,}$", first_vals[2] or "")
     )
 
     if is_wisdm:
-        extra = len(first_vals) - 6
+        extra = n_cols - 6
         hdr = ["user", "activity", "timestamp", "a_x", "a_y", "a_z"] + [f"col{i}" for i in range(extra)]
         df = pd.read_csv(io.StringIO(text), sep=sep, header=None, names=hdr, engine="python")
-        notes.append("WISDM dataset format detected (user, activity, timestamp, x, y, z)")
+        notes.append("WISDM dataset format detected")
+
     elif first_is_numeric:
-        # UCI HAR: space-separated, 561 features, no header
-        if sep == r"\s+" and len(first_vals) > 20:
+        # ── Headerless with column count != 4 ─────────────────────────────────
+        if sep == r"\s+" and n_cols > 20:
             raise ValueError(
-                "This appears to be a pre-processed feature file (561 columns). "
-                "EdgeForge needs raw accelerometer time series data, not pre-extracted features."
+                "This appears to be a pre-processed feature file (many columns). "
+                "EdgeForge needs raw accelerometer time series data."
             )
-        # Headerless CSV: assume timestamp,a_x,a_y,a_z or just a_x,a_y,a_z
-        n_cols = len(first_vals)
         if n_cols >= 4:
             hdr = ["timestamp", "a_x", "a_y", "a_z"] + [f"col{i}" for i in range(n_cols - 4)]
         elif n_cols == 3:
@@ -358,41 +398,33 @@ def _parse_csv_flexible(content: bytes) -> tuple:
             hdr = ["a_x"]
         else:
             hdr = ["a_x", "a_y"]
-        notes.append(f"No header row detected — assumed columns: {', '.join(hdr[:4])}")
+        notes.append(f"No header detected — assumed columns: {', '.join(hdr[:4])}")
         df = pd.read_csv(io.StringIO(text), sep=sep, header=None, names=hdr, engine="python")
+
     else:
+        # ── File has a header row ──────────────────────────────────────────────
         df = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
 
-    # ── Normalise column names ─────────────────────────────────────────────────
+    # ── Normalise column names via alias map ───────────────────────────────────
     orig_cols = list(df.columns)
     df.columns = [_UPLOAD_COL_MAP.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns]
     norm_cols  = list(df.columns)
 
-    detected_cols = [o for o, n in zip(orig_cols, norm_cols) if o != n]
-    if detected_cols:
-        notes.append(f"Columns detected: {', '.join(str(c) for c in orig_cols)} — mapped to EdgeForge format")
-
-    # ── WISDM format: user, activity, timestamp, x, y, z ──────────────────────
+    # ── WISDM activity label extraction ───────────────────────────────────────
     if "activity" in norm_cols:
-        # Extract the most common activity label as the class
-        act_col = df.columns[norm_cols.index("activity")] if "activity" in norm_cols else "activity"
         activities = df["activity"].dropna().astype(str).str.strip(";").str.strip()
         most_common = activities.mode()
         if len(most_common) > 0:
             raw_act = str(most_common.iloc[0])
             detected_label = _WISDM_ACTIVITY_MAP.get(raw_act, raw_act)
-            unique_acts    = activities.unique().tolist()
-            notes.append(
-                f"WISDM format detected — activity column found: {unique_acts[:5]}"
-                + (f" ... (+{len(unique_acts)-5} more)" if len(unique_acts) > 5 else "")
-                + f". Using '{detected_label}' as class label."
-            )
+            notes.append(f"WISDM activity detected: '{detected_label}'")
 
     # ── Require at least a_x ──────────────────────────────────────────────────
     if "a_x" not in norm_cols:
         raise ValueError(
-            f"No recognised X-axis column. Got columns: {orig_cols}. "
-            "Expected one of: a_x, x, ax, accel_x, acc_x"
+            f"No X-axis column found. Got columns: {orig_cols}. "
+            "Expected format: timestamp_us, ax, ay, az (no header row) — "
+            f"got {n_cols} column(s)"
         )
 
     # ── Fill missing axes ──────────────────────────────────────────────────────
@@ -403,9 +435,9 @@ def _parse_csv_flexible(content: bytes) -> tuple:
     # ── Ensure timestamp column ────────────────────────────────────────────────
     if "timestamp" not in norm_cols:
         df["timestamp"] = DT_US
-        notes.append(f"No timestamp column found — assuming {int(SAMPLE_RATE_HZ)} Hz sample rate")
+        notes.append(f"No timestamp column — assuming {int(SAMPLE_RATE_HZ)} Hz")
 
-    # ── Keep only needed columns ───────────────────────────────────────────────
+    # ── Keep only needed columns, coerce, drop NaN ────────────────────────────
     df = df[["timestamp", "a_x", "a_y", "a_z"]].copy()
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -414,28 +446,37 @@ def _parse_csv_flexible(content: bytes) -> tuple:
     if len(df) < 2:
         raise ValueError("File has fewer than 2 valid numeric data rows after parsing")
 
-    # ── Convert absolute epoch timestamps to per-sample diffs ─────────────────
+    # ── Convert absolute epoch timestamps → per-sample intervals ──────────────
     ts = df["timestamp"].values
     if len(ts) > 1 and ts[0] > 1e9:
         diffs = np.diff(ts, prepend=ts[1])
         df["timestamp"] = np.abs(diffs)
         notes.append("Absolute timestamps converted to per-sample intervals")
 
-    # Clamp unreasonable timestamps (< 100µs or > 1s) to DT_US
     df["timestamp"] = df["timestamp"].clip(lower=100, upper=1_000_000).fillna(DT_US)
-
     return df, notes, detected_label
 
 
 def _label_from_filename(filename: str) -> str | None:
     """
-    Extract a class label from a filename stem.
-    'metal_event_003.csv' → 'metal',  'wood tap (2).txt' → 'wood'
-    Takes the first non-numeric, non-empty token after splitting on separators.
+    Extract class label as the FIRST word before any separator/digit in the filename.
+    Examples:
+      metal_tap_01.csv  → 'metal'
+      wood_event_003.csv → 'wood'
+      plastic01.csv     → 'plastic'
+      METAL_TAP.csv     → 'metal'
     """
-    base   = filename.split("/")[-1].rsplit(".", 1)[0]   # strip path + extension
-    tokens = [t for t in re.split(r"[_\-\s()]+", base.lower()) if t and not t.isdigit()]
-    return tokens[0] if tokens else None
+    base = filename.split("/")[-1].rsplit(".", 1)[0].lower()  # strip path + extension, lowercase
+    # Split on underscores, dashes, spaces, parens
+    tokens = re.split(r"[_\-\s()]+", base)
+    for token in tokens:
+        if not token:
+            continue
+        # Strip any trailing digits (e.g. 'plastic01' → 'plastic')
+        cleaned = re.sub(r"\d+$", "", token)
+        if cleaned and not cleaned.isdigit():
+            return cleaned
+    return None
 
 
 def _zip_extract_csvs(content: bytes) -> list:
@@ -562,7 +603,11 @@ async def upload_events(
                 df, notes, detected = _parse_csv_flexible(raw)
                 n      = len(df)
                 dur_ms = float(df["timestamp"].sum()) / 1000.0
-                final_label = detected if (label == "auto" and detected) else label
+                if label == "auto":
+                    # WISDM activity column → filename first word → fallback
+                    final_label = detected or _label_from_filename(fname) or "unknown"
+                else:
+                    final_label = label
                 ev = EventData(
                     ax          = df["a_x"].tolist(),
                     ay          = df["a_y"].tolist(),
@@ -607,10 +652,20 @@ async def upload_events(
     except Exception:
         analysis = None
 
+    # Collect unique detected class names (preserving order of first occurrence)
+    seen: set = set()
+    detected_classes: list = []
+    for ev in event_meta:
+        lbl = ev.get("class_label", "")
+        if lbl and lbl not in seen:
+            seen.add(lbl)
+            detected_classes.append(lbl)
+
     return {
-        "events":   event_meta,
-        "analysis": analysis,
-        "errors":   errors,
+        "events":           event_meta,
+        "detected_classes": detected_classes,
+        "analysis":         analysis,
+        "errors":           errors,
     }
 
 
